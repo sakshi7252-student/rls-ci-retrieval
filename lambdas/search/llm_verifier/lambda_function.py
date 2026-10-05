@@ -133,37 +133,20 @@ def _verify_batch(
         if desc:
             asset_ctx = f"Drug/Regimen Context: {_re.sub(chr(60)+'[^>]+>','',desc).strip()[:500]}\n\n"
 
-    # Build one block per candidate — label prev/current/next so the model knows
-    # which span is the actual retrieved candidate vs. surrounding context only.
+    # Build one block per candidate
     blocks = []
     for i, c in enumerate(candidates, 1):
         ctx = c.get("context", {})
-        prev_t, cur_t, next_t = ctx.get("prev_text", ""), ctx.get("current_text", ""), ctx.get("next_text", "")
-        excerpt_parts = []
-        if prev_t:
-            excerpt_parts.append(f"[PRECEDING CONTEXT]\n{prev_t}")
-        excerpt_parts.append(f"[CURRENT EXCERPT]\n{cur_t}")
-        if next_t:
-            excerpt_parts.append(f"[FOLLOWING CONTEXT]\n{next_t}")
-        excerpt = "\n\n".join(excerpt_parts)[:2500]
+        excerpt = "\n".join(filter(None, [
+            ctx.get("prev_text", ""), ctx.get("current_text", ""), ctx.get("next_text", "")
+        ]))[:2500]
         blocks.append(f"--- CANDIDATE {i} (p{c.get('page_start')}\u2013{c.get('page_end')}) ---\n{excerpt}")
 
     prompt = (
         f"You are a clinical document reviewer.\n\n"
         f"{doc_profile}{ci_drug_note}{asset_ctx}"
         f'Confidential Information (CI): "{ci_text}"\n\n'
-        f"Each candidate's CURRENT EXCERPT is the actual retrieved match being judged; PRECEDING/"
-        f"FOLLOWING CONTEXT is given only so you can interpret it correctly (resolve pronouns, "
-        f"abbreviations, sentences continued across a chunk boundary, etc.). Two kinds of evidence "
-        f"support YES: (1) LITERAL — the CI's exact fact/number/phrase appears verbatim in the "
-        f"CURRENT EXCERPT itself; (2) SEMANTIC — the CURRENT EXCERPT, once correctly understood "
-        f"using its context, is itself substantively discussing the same clinical topic/fact as the "
-        f"CI (not just mentioning a keyword in passing). A CURRENT EXCERPT that is actually about a "
-        f"different topic does NOT become a match just because the CI's fact happens to appear "
-        f"somewhere in the surrounding context on the same page — that is evidence for a different, "
-        f"nearby excerpt, not this one. In that case the verdict must be NO or MAYBE.\n\n"
-        f"For each candidate below, decide if its CURRENT EXCERPT (as understood using its context) "
-        f"contains or semantically identifies the CI.\n\n"
+        f"For each candidate below, decide if the excerpt contains or directly identifies the CI.\n\n"
         f"For each identity dimension answer true or false:\n"
         f"  same_drug       — excerpt discusses the same drug/regimen as the CI\n"
         f"  same_study      — excerpt is from the same trial/study as the CI\n"
@@ -254,17 +237,12 @@ def _strip_code_fence(text: str) -> str:
 
 def _verify(ci_text: str, candidate: dict, doc_ctx: dict | None = None,
             ci_assets: list | None = None) -> dict:
-    # Label prev/current/next so the model knows which span is the actual
-    # retrieved candidate vs. surrounding context only.
     ctx      = candidate.get("context", {})
-    prev_t, cur_t, next_t = ctx.get("prev_text", ""), ctx.get("current_text", ""), ctx.get("next_text", "")
-    excerpt_parts = []
-    if prev_t:
-        excerpt_parts.append(f"[PRECEDING CONTEXT]\n{prev_t}")
-    excerpt_parts.append(f"[CURRENT EXCERPT]\n{cur_t}")
-    if next_t:
-        excerpt_parts.append(f"[FOLLOWING CONTEXT]\n{next_t}")
-    combined = "\n\n".join(excerpt_parts)[:3000]
+    combined = "\n".join(filter(None, [
+        ctx.get("prev_text", ""),
+        ctx.get("current_text", ""),
+        ctx.get("next_text", ""),
+    ]))[:3000]
 
     # Document profile header
     doc_profile = ""
@@ -333,18 +311,7 @@ def _verify(ci_text: str, candidate: dict, doc_ctx: dict | None = None,
         f"Confidential Information (CI): \"{ci_text}\"\n\n"
         f"Document excerpt (pages {candidate.get('page_start')}–"
         f"{candidate.get('page_end')}):\n{combined}\n\n"
-        f"The CURRENT EXCERPT is the actual retrieved candidate being judged; PRECEDING/FOLLOWING "
-        f"CONTEXT is given only so you can interpret it correctly (resolve pronouns, abbreviations, "
-        f"sentences continued across a chunk boundary, etc.). Two kinds of evidence support YES: "
-        f"(1) LITERAL — the CI's exact fact/number/phrase appears verbatim in the CURRENT EXCERPT "
-        f"itself; (2) SEMANTIC — the CURRENT EXCERPT, once correctly understood using its context, "
-        f"is itself substantively discussing the same clinical topic/fact as the CI (not just "
-        f"mentioning a keyword in passing). A CURRENT EXCERPT that is actually about a different "
-        f"topic does NOT become a match just because the CI's fact happens to appear somewhere in "
-        f"the surrounding context on the same page — that is evidence for a different, nearby "
-        f"excerpt, not this one. In that case the verdict must be NO or MAYBE.\n\n"
-        f"Does the CURRENT EXCERPT (as understood using its context) contain or semantically "
-        f"identify the CI?\n\n"
+        f"Does this excerpt contain or directly identify the CI?\n\n"
         f"For each identity dimension answer true or false:\n"
         f"  same_drug       — excerpt discusses the same drug/regimen as the CI\n"
         f"  same_study      — excerpt is from the same trial/study as the CI\n"
