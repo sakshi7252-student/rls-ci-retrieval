@@ -16,25 +16,10 @@ ExpandedCandidate schema
     "sources":       list[str],
     "agg_score":     float,
     "context": {
-        # Primary fields — what the verifier should read.
-        "matched_evidence": str,  # the SINGLE matched span only (never paragraph+window merged)
-        "previous_text":    str,  # immediate previous sentence/object (or prev chunk, if unanchored)
-        "next_text":        str,  # immediate next sentence/object (or next chunk, if unanchored)
-        "parent_paragraph": str,  # full parent paragraph — sentence hits only, context only
-        "section_heading":  str,  # normalized section heading path — interpretive only
-        "table_context":    str,  # full table text (context only) when matched_obj is a table row/cell
-        "context_type":     str,  # same value as top-level context_strategy
-        # Legacy aliases kept for existing consumers (merger/reranker/worker read these directly).
-        "current_text":     str,  # == matched_evidence for anchored hits; whole chunk if unanchored
-        "heading_context":  str,  # == section_heading
-        "prev_text":        str,  # == previous_text
-        "parent_text":      str,  # == parent_paragraph
-        "neighbor_kind":    str,  # "object": prev/next are the matched object's own neighbours
-                                  # "chunk":  prev/next are the adjacent chunks (unanchored candidates)
-    },
-    "anchored":          bool,  # True when a specific object (direct hit, or a chunk object that really
-                                # contains a literal CI match) is the matched span; False = chunk-level only
-    "unanchored_reason": str|None,  # no_literal | literal_not_in_objects | no_context_objects
+        "prev_text":    str,   # last 500 chars of preceding chunk (if any)
+        "current_text": str,   # full raw_text of this chunk
+        "next_text":    str,   # first 500 chars of following chunk (if any)
+    }
 }
 """
 
@@ -61,15 +46,6 @@ OPENSEARCH_MAXSIZE  = int(os.environ.get("OPENSEARCH_MAXSIZE", "256"))
 TABLE_CONTEXT_MAX_OBJECTS = int(os.environ.get("TABLE_CONTEXT_MAX_OBJECTS", "200"))
 TABLE_CONTEXT_MAX_CHARS = int(os.environ.get("TABLE_CONTEXT_MAX_CHARS", "16000"))
 CONTEXT_EXPANDER_WORKERS = int(os.environ.get("CONTEXT_EXPANDER_WORKERS", "1"))
-# Objects fetched per chunk for chunk-level (via_chunk) candidates. The old hard-coded 100 cut off
-# long multi-page chunks, so a literal match late in the chunk was never found.
-CHUNK_OBJECTS_MAX = int(os.environ.get("CHUNK_OBJECTS_MAX", "400"))
-# Whole-chunk text cap (unanchored candidates) so the payload and verifier prompt stay bounded.
-CHUNK_TEXT_MAX_CHARS = int(os.environ.get("CHUNK_TEXT_MAX_CHARS", "8000"))
-# prev/next for an anchored object = this many same-type neighbouring objects each side.
-NEIGHBOR_OBJECTS = int(os.environ.get("NEIGHBOR_OBJECTS", "2"))
-# 1 = also attach adjacent-CHUNK text to anchored objects (old behaviour; causes cross-chunk bleed).
-CHUNK_NEIGHBORS_FOR_ANCHORED = os.environ.get("CHUNK_NEIGHBORS_FOR_ANCHORED", "0") == "1"
 
 def _get_os():
     from shared.opensearch_client import get_opensearch_client
@@ -155,21 +131,6 @@ def _process(req: dict) -> dict:
     if missed:
         chunk_cache.update(_mget_chunks(missed))
 
-    # Exact chunk adjacency (chunk_idx ±1) for candidates that need adjacent-chunk text:
-    # chunk-level candidates (no matched object) and, optionally, anchored ones.
-    extra_idx: set[int] = set()
-    for c in candidates:
-        if c.get("matched_object") and not CHUNK_NEIGHBORS_FOR_ANCHORED:
-            continue
-        self_idx = (chunk_cache.get(c.get("chunk_id", "")) or {}).get("chunk_idx")
-        if isinstance(self_idx, int):
-            for k in (self_idx - 1, self_idx + 1):
-                if k >= 0 and k not in idx_cache:
-                    extra_idx.add(k)
-    if extra_idx:
-        idx_cache.update(_msearch_by_idx(document_id, sorted(extra_idx),
-                                         tenant_id=tenant_id, project_id=project_id))
-
     logger.info(
         "[Context Expander] search_id=%s  candidates=%d  idx_lookups=%d"
         "  ctx_queries=%d  chunk_cache_hits=%d/%d",
@@ -215,15 +176,6 @@ def _normalize_heading(heading: str) -> str:
     return " > ".join(cleaned)
 
 
-_DEDUP_NORMALIZE_RE = re.compile(r"[^\w]+")
-
-def _normalize_for_dedup(text: str) -> str:
-    """Collapse whitespace/punctuation/case so near-identical spans (e.g. a sentence
-    window that's just the paragraph's own tail, re-rendered with different tab/period
-    formatting) are recognized as duplicates rather than appended again verbatim."""
-    return _DEDUP_NORMALIZE_RE.sub(" ", text.lower()).strip()
-
-
 # ── Context object sorter ─────────────────────────────────────────────────────
 
 _CTX_TYPE_ORDER = {
@@ -260,55 +212,6 @@ def _sort_context_objects(
     return sorted(objs, key=_key)
 
 
-_TABLE_TYPES = {"table_header", "table_row", "table_cell"}
-
-# Unicode variants that differ between a retriever's literal text and the indexed object text.
-_NORM_TR = str.maketrans({
-    "‘": "'", "’": "'", "“": '"', "”": '"',
-    "–": "-", "—": "-", "‑": "-", " ": " ",
-})
-
-
-def _norm_match(text: Any) -> str:
-    """Lowercase, collapse whitespace, unify quotes/dashes. For containment checks only —
-    indexed text has double spaces and curly quotes that a retriever's literal usually lacks."""
-    if not isinstance(text, str):
-        return ""
-    return re.sub(r"\s+", " ", text.translate(_NORM_TR)).strip().lower()
-
-
-def _local_neighbors(
-    context_objects: list[dict],
-    matched_obj:     dict | None,
-    n:               int,
-) -> tuple[str, str]:
-    """Text immediately before/after the matched object, taken from ITS OWN neighbours
-    (same object type, by global_position) — not from adjacent chunks, which can be
-    thousands of characters away and carry unrelated facts."""
-    if not matched_obj or not context_objects:
-        return "", ""
-    mtype = matched_obj.get("type")
-    mid   = matched_obj.get("object_id")
-    mpos  = matched_obj.get("global_position")
-    if mpos is None:
-        return "", ""
-    same = [
-        o for o in context_objects
-        if o.get("type") == mtype and o.get("object_id") != mid
-        and isinstance(o.get("global_position"), int)
-        and str(o.get("text") or "").strip()
-    ]
-    before = sorted((o for o in same if o["global_position"] < mpos),
-                    key=lambda o: o["global_position"])[-n:]
-    after  = sorted((o for o in same if o["global_position"] > mpos),
-                    key=lambda o: o["global_position"])[:n]
-
-    def _join(objs: list[dict]) -> str:
-        return " ".join(" ".join(str(o["text"]).split()) for o in objs)
-
-    return _join(before), _join(after)
-
-
 def _expand(
     candidate:   dict,
     document_id: str | None,
@@ -323,11 +226,7 @@ def _expand(
     page_end   = candidate.get("page_end",   0)
 
     chunk_doc    = chunk_cache.get(chunk_id, {})
-    chunk_text   = chunk_doc.get("raw_text", "")
-    current_text = chunk_text
-    # Section heading, kept OUT of current_text — sent to the verifier as its own
-    # labeled block since it's interpretive context, not part of the matched span itself.
-    heading_context = ""
+    current_text = chunk_doc.get("raw_text", "")
 
     # If candidate came from semantic-objects index it already has the matched object
     matched_obj = candidate.get("matched_object")   # set by retriever for object-level hits
@@ -341,33 +240,25 @@ def _expand(
     # Table-aware context: the matched table object remains the matched object,
     # while the verifier receives the complete table structure around it.
     #
-    # IMPORTANT: list_item is also table-aware when it carries a table_id. Nested list items
-    # inside a table_cell carry the same canonical table_id/cell_id relationship as table
-    # rows/cells, so such a hit must expand to its table context too.
-    # table_text holds the FULL table (sent to the verifier as context only, <table> tag).
-    # current_text stays the matched row/cell's OWN text, so the verifier is judged on what
-    # was actually matched, not credited for unrelated rows/cells sharing the same table.
+    # IMPORTANT: list_item is also table-aware. Nested list items inside a
+    # table_cell carry the same canonical table_id/cell_id relationship as
+    # table rows/cells, so a list_item hit must expand to its table context too.
+    # Do not treat it as an ordinary document-level list hit.
     table_context_objects: list[dict] = []
-    table_text = ""
-    if matched_obj and matched_obj.get("type") in _TABLE_TYPES | {"list_item"}:
+    if matched_obj and matched_obj.get("type") in {
+        "table_header", "table_row", "table_cell", "list_item"
+    }:
         table_id = matched_obj.get("table_id")
         if table_id:
             table_context_objects = table_cache.get(str(table_id), [])
             if table_context_objects:
-                table_text = _format_table_context(table_context_objects, matched_obj)
-                own_text   = (matched_obj.get("text") or "").strip()
-                current_text = own_text or table_text
+                current_text = _format_table_context(table_context_objects, matched_obj)
                 context_strategy = "table_full"
-                raw_heading = (matched_obj.get("heading_path") or matched_obj.get("semantic_path") or "").strip()
-                heading_context = _normalize_heading(raw_heading) if raw_heading else ""
 
-    # For sentence-level hits: current_text (== matched_evidence) is the matched sentence
-    # ALONE. Its parent paragraph and immediate neighbour sentences are never merged into it —
-    # they're exposed as their own context-only fields (parent_paragraph/previous_text/next_text)
-    # so the verifier can't mistake surrounding text for the matched span itself.
-    parent_paragraph_text = ""
-    sentence_prev_text    = ""
-    sentence_next_text    = ""
+    # For sentence-level hits, build hierarchical context:
+    #   normalized heading → parent paragraph (only when multi-sentence) → 3-sentence window.
+    # Preserves the semantic hierarchy (drug / endpoint / disease inherited from heading)
+    # while keeping the verifier's context tight and precise.
     if matched_obj and matched_obj.get("type") == "sentence":
         raw_heading = (matched_obj.get("heading_path") or matched_obj.get("semantic_path") or "").strip()
         heading     = _normalize_heading(raw_heading) if raw_heading else ""
@@ -375,43 +266,39 @@ def _expand(
         sent_text   = (matched_obj.get("text") or "").strip()
         prev_s      = (matched_obj.get("prev_sentence_text") or "").strip()
         next_s      = (matched_obj.get("next_sentence_text") or "").strip()
+        sent_window = " ".join(p for p in [prev_s, sent_text, next_s] if p)
 
-        if sent_text:
-            current_text     = sent_text
-            context_strategy = "sentence_hierarchical"
-        # Single-sentence paragraph == the sentence itself — would be a no-op duplicate block.
-        if para_text and para_text != sent_text:
-            parent_paragraph_text = para_text
-        sentence_prev_text = prev_s
-        sentence_next_text = next_s
+        ctx_parts: list[str] = []
         if heading:
-            heading_context = heading
+            ctx_parts.append(heading)
+        # Include parent paragraph only when it contains more than this one sentence
+        # (para_text == sent_text means single-sentence paragraph — would be redundant)
+        if para_text and para_text != sent_text:
+            ctx_parts.append(para_text)
+        if sent_window:
+            ctx_parts.append(sent_window)
 
-    # Extract adjacency indices set by the section chunker (direct hits only; via_chunk
-    # candidates have no matched object yet, so chunk adjacency comes from the chunk doc below).
+        if ctx_parts:
+            current_text     = "\n\n".join(ctx_parts)
+            context_strategy = "sentence_hierarchical"
+
+    # Extract adjacency indices set by the section chunker
     obj_meta         = matched_obj or {}
+    chunk_idx        = obj_meta.get("chunk_idx")
     prev_chunk_idx   = obj_meta.get("prev_chunk_idx")
     next_chunk_idx   = obj_meta.get("next_chunk_idx")
     parent_chunk_idx = obj_meta.get("parent_chunk_idx")
 
-    # Adjacent CHUNK text. Exact chunk_idx adjacency when known (object metadata, or the chunk
-    # doc's own chunk_idx ±1). The page-range lookup is only a last resort: chunks overlap page
-    # ranges, so "first chunk starting on page_end+1" can skip a chunk and return the wrong one.
-    self_idx = chunk_doc.get("chunk_idx")
-    if prev_chunk_idx is None and isinstance(self_idx, int):
-        prev_chunk_idx = self_idx - 1
-    if next_chunk_idx is None and isinstance(self_idx, int):
-        next_chunk_idx = self_idx + 1
-
+    # Prefer exact adjacency-index lookup (from msearch cache) over page-range heuristic
     if prev_chunk_idx is not None:
-        chunk_prev_text = idx_cache.get(prev_chunk_idx, "")
+        prev_text = idx_cache.get(prev_chunk_idx, "")
     else:
-        chunk_prev_text = page_cache.get(("page_end", page_start - 1), "")
+        prev_text = page_cache.get(("page_end", page_start - 1), "")
 
     if next_chunk_idx is not None:
-        chunk_next_text = idx_cache.get(next_chunk_idx, "")
+        next_text = idx_cache.get(next_chunk_idx, "")
     else:
-        chunk_next_text = page_cache.get(("page_start", page_end + 1), "")
+        next_text = page_cache.get(("page_start", page_end + 1), "")
 
     parent_text = idx_cache.get(parent_chunk_idx, "") if parent_chunk_idx is not None else ""
 
@@ -429,95 +316,45 @@ def _expand(
 
     # Track why this object was selected — useful for debugging retrieval decisions:
     #   retriever_direct  — retriever set matched_object directly from semantic-objects
-    #   literal_match     — via_chunk: an object in the chunk really contains a literal CI match
-    #   chunk_only        — via_chunk: NO object could be anchored (no literal, literal not found in
-    #                       any object, or no context objects). matched_object stays None and
-    #                       `unanchored_reason` says why. The verifier judges the chunk text and the
-    #                       span is anchored afterwards from the verifier's quoted evidence.
-    #
-    # The old "highest_priority" fallback (pick the first sentence in the chunk) is gone: it
-    # attached the chunk's verdict to an arbitrary sentence, which is how unrelated sentences
-    # ended up as final hits with 0.9+ confidence.
+    #   literal_match     — via_chunk: chosen because text contained a literal CI match
+    #   highest_priority  — via_chunk: chosen by type-priority (sentence > paragraph > …)
+    #   chunk_only        — via_chunk: no context objects found at all
     selection_reason    = "retriever_direct" if origin_is_direct else None
-    literal_match_count = 0
-    anchored            = origin_is_direct
-    unanchored_reason   = None
+    literal_match_count = 0      # set below when selection_reason == "literal_match"
 
     if matched_obj is None and context_objects:
-        lit_texts = [t for t in (_norm_match(lm.get("text"))
-                                 for lm in (candidate.get("literal_matches") or []))
-                     if t]
+        lit_texts = [lm["text"].lower()
+                     for lm in candidate.get("literal_matches", [])
+                     if lm.get("text")]
         if lit_texts:
-            containing = [o for o in context_objects
-                          if any(lt in _norm_match(o.get("text")) for lt in lit_texts)]
-            if containing:
-                # Among objects that contain the match, prefer the most specific type
-                # (sentence > paragraph) so the UI highlights the tightest span.
-                matched_obj = max(containing,
-                                  key=lambda o: _OBJECT_TYPE_PRIORITY.get(o.get("type", ""), 0))
-                selection_reason    = "literal_match"
-                literal_match_count = len(containing)
-                anchored            = True
-            else:
-                selection_reason  = "chunk_only"
-                unanchored_reason = "literal_not_in_objects"
+            # Prefer the object whose text contains the literal match.
+            # Among objects that contain the match, prefer the most specific
+            # type (sentence > paragraph) so the UI highlights the tightest span.
+            # Fall back to type-priority ordering when no object contains the match.
+            def _lit_key(o: dict) -> tuple:
+                obj_lower = (o.get("text") or "").lower()
+                return (int(any(lt in obj_lower for lt in lit_texts)),
+                        _OBJECT_TYPE_PRIORITY.get(o.get("type", ""), 0))
+            matched_obj         = max(context_objects, key=_lit_key)
+            selection_reason    = "literal_match"
+            # How many context objects contained the literal — low count = high confidence
+            literal_match_count = sum(
+                1 for o in context_objects
+                if any(lt in (o.get("text") or "").lower() for lt in lit_texts)
+            )
         else:
-            selection_reason  = "chunk_only"
-            unanchored_reason = "no_literal"
+            matched_obj      = max(
+                context_objects,
+                key=lambda o: _OBJECT_TYPE_PRIORITY.get(o.get("type", ""), 0),
+            )
+            selection_reason = "highest_priority"
     elif matched_obj is None:
-        selection_reason  = "chunk_only"
-        unanchored_reason = "no_context_objects"
+        selection_reason = "chunk_only"   # no context objects available
 
     # Finalize context_strategy now that matched_obj is settled.
-    # Table cells/rows/headers (and list items that belong to a table) that fell through here
-    # (missing/unresolved table_id) keep the whole-chunk text — a lone table cell (e.g. "72")
-    # is meaningless without its surrounding table. Everything else, including an ordinary
-    # list item, swaps to the matched object's own text; otherwise it silently stays the
-    # whole-chunk raw_text, letting unrelated facts elsewhere in the chunk get credited to it.
+    # "sentence_hierarchical" is already set above; all other types take the object type name.
     if context_strategy == "chunk_fallback" and matched_obj is not None:
-        mtype = matched_obj.get("type")
-        keeps_chunk = mtype in _TABLE_TYPES or (mtype == "list_item" and matched_obj.get("table_id"))
-        if not keeps_chunk:
-            own_text = (matched_obj.get("text") or matched_obj.get("paragraph_text") or "").strip()
-            if own_text:
-                current_text = own_text
-                raw_heading  = (matched_obj.get("heading_path") or matched_obj.get("semantic_path") or "").strip()
-                heading_context = _normalize_heading(raw_heading) if raw_heading else ""
-        context_strategy = mtype or "unknown"
-
-    # Whole-chunk text (unanchored, or table-ish fallthrough) is capped so the payload and the
-    # verifier prompt stay bounded.
-    if current_text is chunk_text and len(current_text) > CHUNK_TEXT_MAX_CHARS:
-        current_text = current_text[:CHUNK_TEXT_MAX_CHARS]
-
-    # prev/next meaning:
-    #   anchored   -> the matched object's OWN neighbours (same type, from this chunk's objects).
-    #                 Sentence hits already carry a ±1 sentence window in current_text and table
-    #                 hits carry the table in table_context, so those get no extra neighbours.
-    #   unanchored -> the adjacent chunks (exact chunk_idx adjacency when available).
-    # Adjacent-chunk text is NOT attached to anchored objects by default: it is unrelated to the
-    # object and was the source of cross-chunk bleed (a neighbouring chunk's matching text being
-    # credited to an unrelated sentence). Set CHUNK_NEIGHBORS_FOR_ANCHORED=1 to restore it.
-    if anchored and not CHUNK_NEIGHBORS_FOR_ANCHORED:
-        if context_strategy == "sentence_hierarchical":
-            prev_text, next_text = sentence_prev_text, sentence_next_text
-        elif context_strategy == "table_full":
-            prev_text, next_text = "", ""
-        else:
-            prev_text, next_text = _local_neighbors(context_objects, matched_obj, NEIGHBOR_OBJECTS)
-        neighbor_kind = "object"
-    else:
-        prev_text, next_text = chunk_prev_text, chunk_next_text
-        neighbor_kind = "chunk"
-
-    # Parent paragraph context: the sentence's own parent paragraph takes precedence; falls back
-    # to the adjacent parent CHUNK text (hierarchical chunk nesting) for non-sentence anchors.
-    parent_paragraph_display = parent_paragraph_text or parent_text
-
-    # matched_evidence is populated only when a single span was actually located — an unanchored
-    # chunk-level candidate has no evidence yet (the verifier locates and quotes it from the
-    # whole chunk, still available via the legacy current_text/table_context fields).
-    matched_evidence = current_text if anchored else ""
+        context_strategy = matched_obj.get("type", "unknown")
 
     # Sort context_objects by verifier relevance:
     # matched object first, then headings, paragraphs, sentences, tables — each nearest first.
@@ -548,7 +385,7 @@ def _expand(
     )
 
     context_quality = {
-        "parent":    bool(parent_paragraph_display),
+        "parent":    bool(parent_text),
         "prev":      bool(prev_text),
         "next":      bool(next_text),
         "n_objects": len(context_objects),
@@ -565,8 +402,6 @@ def _expand(
         "matched_object":     matched_obj,
         "retrieval_origin":   retrieval_origin,
         "selection_reason":   selection_reason,
-        "anchored":           anchored,
-        "unanchored_reason":  unanchored_reason,
         "literal_match_count": literal_match_count,
         "context_strategy":   context_strategy,
         "matched_distance":   matched_distance,
@@ -575,109 +410,55 @@ def _expand(
         "context_objects":    context_objects,
         "context_quality":    context_quality,
         "context": {
-            # Primary fields — what the verifier should read.
-            "matched_evidence": matched_evidence,
-            "previous_text":    prev_text[-CONTEXT_CHARS:]            if prev_text else "",
-            "next_text":        next_text[:CONTEXT_CHARS]             if next_text else "",
-            "parent_paragraph": parent_paragraph_display[:CONTEXT_CHARS] if parent_paragraph_display else "",
-            "section_heading":  heading_context,
-            "table_context":    table_text,
-            "context_type":     context_strategy,
-            # Legacy aliases — existing consumers (merger/reranker/worker) read these directly.
-            "current_text":     current_text,
-            "heading_context":  heading_context,
-            "prev_text":        prev_text[-CONTEXT_CHARS:] if prev_text else "",
-            "parent_text":      parent_paragraph_display[:CONTEXT_CHARS] if parent_paragraph_display else "",
-            "neighbor_kind":    neighbor_kind,
+            "parent_text":  parent_text[:CONTEXT_CHARS]  if parent_text else "",
+            "prev_text":    prev_text[-CONTEXT_CHARS:]   if prev_text  else "",
+            "current_text": current_text,
+            "next_text":    next_text[:CONTEXT_CHARS]    if next_text  else "",
         },
     }
 
 
 def _format_table_context(table_objects: list[dict], matched_obj: dict) -> str:
-    """Render canonical indexed table objects into a true row/column grid for the verifier.
+    """Render canonical indexed table objects into verifier context.
 
-    A "table_row" object's own text is already the pipe-joined grid line for that row, so it
-    is preferred whenever present. "table_cell" objects are only rendered standalone for rows
-    that have no table_row object indexed (grouped by row_index, ordered by col_start) — this
-    avoids showing both the individual cells AND the row that already joins them, which looks
-    like repeated evidence to the verifier. The matched object's own row is always first.
+    The matched object is always first. Header rows are preserved, followed by
+    table rows in row order. Cells are included only when a row/header has no
+    usable text, preventing cell-level duplication in normal tables.
     """
-    matched_row_index = matched_obj.get("row_index") if isinstance(matched_obj.get("row_index"), int) else None
-
-    headers: list[dict] = []
-    rows_by_index: dict[int, dict] = {}
-    cells_by_index: dict[int, list[dict]] = {}
-    list_items: list[dict] = []
-    other: list[dict] = []
-
-    for o in table_objects:
-        typ = o.get("type") or "table_row"
-        text = " ".join(str(o.get("text") or "").split())
-        if not text:
-            continue
-        ridx = o.get("row_index") if isinstance(o.get("row_index"), int) else None
-        if typ == "table_header":
-            headers.append(o)
-        elif typ == "table_row":
-            if ridx is not None and ridx not in rows_by_index:
-                rows_by_index[ridx] = o
-        elif typ == "table_cell":
-            if ridx is not None:
-                cells_by_index.setdefault(ridx, []).append(o)
-            else:
-                other.append(o)
-        elif typ == "list_item":
-            list_items.append(o)
-        else:
-            other.append(o)
-
-    # Rows with no indexed table_row object: synthesize one grid line from their cells.
-    synthesized_rows: dict[int, str] = {}
-    for ridx, cells in cells_by_index.items():
-        if ridx in rows_by_index:
-            continue
-        ordered = sorted(cells, key=lambda o: o.get("col_start") if isinstance(o.get("col_start"), int) else 10**9)
-        texts = [" ".join(str(o.get("text") or "").split()) for o in ordered]
-        texts = [t for t in texts if t]
-        if texts:
-            synthesized_rows[ridx] = " | ".join(texts)
-
-    all_row_indices = sorted(set(rows_by_index) | set(synthesized_rows))
-    all_row_indices.sort(key=lambda r: (0 if r == matched_row_index else 1, r))
-
+    objs = sorted(
+        table_objects,
+        key=lambda o: (
+            0 if o.get("object_id") == matched_obj.get("object_id") else 1,
+            0 if o.get("type") == "table_header" else 1,
+            o.get("row_index") if isinstance(o.get("row_index"), int) else 10**9,
+            o.get("global_position") if isinstance(o.get("global_position"), int) else 10**9,
+        ),
+    )
     lines: list[str] = []
-    seen_text: set[str] = set()
-
-    def _emit(prefix: str, text: str) -> bool:
-        norm = _normalize_for_dedup(text)
-        if norm and norm in seen_text:
-            return False
-        if norm:
-            seen_text.add(norm)
+    seen: set[str] = set()
+    for o in objs[:TABLE_CONTEXT_MAX_OBJECTS]:
+        oid = str(o.get("object_id") or "")
+        text = " ".join(str(o.get("text") or "").split())
+        typ = o.get("type") or "table_row"
+        if not text or oid in seen:
+            continue
+        seen.add(oid)
+        if typ == "table_header":
+            prefix = "HEADER"
+        elif typ == "table_row":
+            prefix = "ROW"
+        elif typ == "table_cell":
+            prefix = "CELL"
+        elif typ == "list_item":
+            # Explicitly preserve nested list semantics in verifier context.
+            # The list item is not promoted to a row/cell; it remains a list item
+            # associated with its parent table/cell.
+            prefix = "LIST_ITEM"
+        else:
+            prefix = typ.upper()
         lines.append(f"[{prefix}] {text}")
-        return True
-
-    for o in headers[:TABLE_CONTEXT_MAX_OBJECTS]:
-        _emit("HEADER", " ".join(str(o.get("text") or "").split()))
-
-    for ridx in all_row_indices[:TABLE_CONTEXT_MAX_OBJECTS]:
-        text = rows_by_index[ridx]["text"] if ridx in rows_by_index else synthesized_rows[ridx]
-        text = " ".join(str(text).split())
-        _emit("ROW", text)
-        if sum(len(x) + 1 for x in lines) >= TABLE_CONTEXT_MAX_CHARS:
-            return "\n".join(lines)
-
-    # Objects with no row_index (loose cells/other fragments) — kept so nothing is dropped.
-    for o in other[:TABLE_CONTEXT_MAX_OBJECTS]:
-        _emit("CELL", " ".join(str(o.get("text") or "").split()))
-        if sum(len(x) + 1 for x in lines) >= TABLE_CONTEXT_MAX_CHARS:
-            return "\n".join(lines)
-
-    for o in list_items[:TABLE_CONTEXT_MAX_OBJECTS]:
-        _emit("LIST_ITEM", " ".join(str(o.get("text") or "").split()))
         if sum(len(x) + 1 for x in lines) >= TABLE_CONTEXT_MAX_CHARS:
             break
-
     return "\n".join(lines)
 
 
@@ -839,13 +620,8 @@ def _fetch_context_objects_merged(
         for key in without_pos:
             body.append({})
             body.append({
-                "size": CHUNK_OBJECTS_MAX,
-                "query": {"bool": {"filter": [
-                    {"term": {"parent_chunk_id": key[0]}},
-                    *([{"term": {"document_id": document_id}}] if document_id else []),
-                    *([{"term": {"tenant_id": tenant_id}}] if tenant_id else []),
-                    *([{"term": {"project_id": project_id}}] if project_id else []),
-                ]}},
+                "size": 100,
+                "query": {"bool": {"filter": [{"term": {"parent_chunk_id": key[0]}}]}},
                 "sort": [{"global_position": "asc"}],
             })
         try:

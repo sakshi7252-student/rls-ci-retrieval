@@ -36,11 +36,8 @@ def _merge_group(ci_id, ci_text: str, group: list[dict]) -> dict:
     matched_obj = primary.get("matched_object") or primary.get("indexed_object") or {}
     geometry = matched_obj.get("geometry") or primary.get("geometry") or {}
 
+    canonical_text = matched_obj.get("text") or primary.get("text", "") or ""
     context_text = (primary.get("context") or {}).get("current_text") or ""
-    # literal/regex/numeric candidates carry no top-level "text" and, when unanchored, no
-    # matched_object either (context_expander leaves it None) — fall back to the chunk text
-    # the verifier actually judged so downstream (evidence classifier, UI) isn't given "".
-    canonical_text = matched_obj.get("text") or primary.get("text", "") or context_text
 
     chunk_ids = [c.get("chunk_id") for c in ordered if c.get("chunk_id")]
 
@@ -69,11 +66,6 @@ def _merge_group(ci_id, ci_text: str, group: list[dict]) -> dict:
         "sources": sorted({s for c in ordered for s in c.get("sources", [])}),
         "verdict": "YES" if any(c.get("verdict") == "YES" for c in ordered) else "MAYBE",
         "confidence": round(max(c.get("confidence", 0.0) for c in ordered), 3),
-        "match_type": primary.get("match_type"),
-        "reason": primary.get("reason", ""),
-        "evidence": primary.get("evidence", ""),
-        "evidence_grounded": primary.get("evidence_grounded"),
-        "identity": primary.get("identity", {}),
         "chunk_ids": chunk_ids,
         "retrieval_origin": primary.get("retrieval_origin", "direct_unknown"),
         "selection_reason": primary.get("selection_reason"),
