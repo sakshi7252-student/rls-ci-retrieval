@@ -77,7 +77,7 @@ def _process(req: dict) -> dict:
     }
 
 
-_MAX_VERIFY_BATCH = 40  # max candidates per Bedrock call (8000 token output cap)
+_MAX_VERIFY_BATCH = int(os.environ.get("MAX_VERIFY_BATCH", "20"))  # smaller batches reduce cross-candidate copy-paste artifacts
 
 
 def _verify_batch(
@@ -189,9 +189,20 @@ def _verify_batch(
         parsed    = json.loads(text)
         if not isinstance(parsed, list) or len(parsed) == 0:
             raise ValueError(f"Expected list of {len(candidates)}, got {len(parsed) if isinstance(parsed,list) else type(parsed)}")
-        # Pad if Claude returned fewer items than expected rather than doing full sequential fallback
-        while len(parsed) < len(candidates):
-            parsed.append({"verdict": "MAYBE", "confidence": 0.5, "reason": "batch_missing"})
+        # If Claude returned fewer items, verify the missed ones individually
+        # (don't pad with a placeholder — a dropped YES candidate would be misverified)
+        if len(parsed) < len(candidates):
+            logger.warning("[LLM Verifier] batch returned %d/%d — verifying %d missed candidates individually",
+                           len(parsed), len(candidates), len(candidates) - len(parsed))
+            for missed_cand in candidates[len(parsed):]:
+                individual = _verify(ci_text, missed_cand, doc_ctx, ci_assets)
+                parsed.append({
+                    "verdict":    individual.get("verdict", "MAYBE"),
+                    "reason":     individual.get("reason", ""),
+                    "confidence": individual.get("confidence", 0.5),
+                    "identity":   individual.get("identity", {}),
+                    "_tokens":    individual.get("_tokens", {}),
+                })
         parsed = parsed[:len(candidates)]  # truncate any extra items Claude occasionally adds
         results = []
         per_tok = max(1, in_tok // len(candidates)), max(1, out_tok // len(candidates))
