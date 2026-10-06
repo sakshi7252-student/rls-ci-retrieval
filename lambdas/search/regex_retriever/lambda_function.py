@@ -8,7 +8,7 @@ Strategy: fetch candidate chunks via BM25 (broad), then apply Python regex
 for precision.  OpenSearch regexp is limited; Python re gives full control.
 
 Input:  classified search request  (ci must have "ontology.regex_patterns")
-Output: { "retriever": "regex", "hits": list[Hit] }
+Output: { "retriever": "regex", "hits": list[Hit] }  # hits include regex_matches: [{text,start,end}]
 """
 
 from __future__ import annotations
@@ -110,25 +110,33 @@ def _regex_search(
         src      = h.get("_source", {})
         raw_text = src.get("raw_text", "")
 
-        # Count how many patterns match; use match count as score proxy
-        match_count = 0
+        # Count how many patterns match; use match count as score proxy.
+        # Collect every match's exact span (not just the first) so context_expander
+        # can resolve the containing object the same way it does for literal hits.
+        match_count   = 0
         first_snippet = ""
+        seen_starts: set[int] = set()
+        regex_matches: list[dict] = []
         for pat in patterns:
-            m = pat.search(raw_text)
-            if m:
+            for m in pat.finditer(raw_text):
                 match_count += 1
                 if not first_snippet:
-                    start   = max(0, m.start() - 80)
-                    end     = min(len(raw_text), m.end() + 80)
+                    start = max(0, m.start() - 80)
+                    end   = min(len(raw_text), m.end() + 80)
                     first_snippet = raw_text[start:end]
+                if m.start() not in seen_starts:
+                    seen_starts.add(m.start())
+                    regex_matches.append({"text": m.group(0), "start": m.start(), "end": m.end(), "source": "regex"})
 
         if match_count > 0:
+            regex_matches.sort(key=lambda rm: rm["start"])
             hits.append({
-                "chunk_id":   src.get("chunk_id", h["_id"]),
-                "score":      float(match_count),
-                "page_start": src.get("page_start", 0),
-                "page_end":   src.get("page_end",   0),
-                "snippet":    first_snippet[:200],
+                "chunk_id":      src.get("chunk_id", h["_id"]),
+                "score":         float(match_count),
+                "page_start":    src.get("page_start", 0),
+                "page_end":      src.get("page_end",   0),
+                "snippet":       first_snippet[:200],
+                "regex_matches": regex_matches,
             })
 
     hits.sort(key=lambda x: x["score"], reverse=True)

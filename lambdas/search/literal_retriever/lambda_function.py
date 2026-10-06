@@ -345,12 +345,15 @@ def _parse_hits(resp: dict, ci_text: str = "") -> list[dict]:
     for h in resp.get("hits", {}).get("hits", []):
         src = h.get("_source", {})
         raw = src.get("raw_text", "")
+        literal_matches = _extract_literal_matches(ci_text, raw) if ci_text else []
+        for lm in literal_matches:
+            lm["source"] = "literal"
         hits.append({
             "chunk_id":        src.get("chunk_id", h["_id"]),
             "score":           round(h.get("_score", 0.0), 4),
             "page_start":      src.get("page_start", 0),
             "page_end":        src.get("page_end",   0),
             "snippet":         raw[:200],
-            "literal_matches": _extract_literal_matches(ci_text, raw) if ci_text else [],
+            "literal_matches": literal_matches,
         })
     return hits

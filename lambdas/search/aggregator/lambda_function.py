@@ -481,6 +481,15 @@ def _process(req: dict) -> dict:
     }
 
 
+# Retrievers whose hits carry their own precise {text,start,end} span in raw_text,
+# keyed by the hit field that holds it. All feed the same "literal_matches" accumulator
+# on the merged candidate — add new retrievers here as they gain exact-span extraction.
+_EXACT_MATCH_FIELD_BY_RETRIEVER = {
+    "literal": "literal_matches",
+    "regex":   "regex_matches",
+}
+
+
 def _merge(retriever_results: list[dict]) -> list[dict]:
     """
     Cluster hits from all retrievers into deduplicated candidates.
@@ -527,11 +536,14 @@ def _merge(retriever_results: list[dict]) -> list[dict]:
             if score > entry["_per_scores"].get(retriever, 0.0):
                 entry["_per_scores"][retriever] = score
 
-            # Propagate matched terms from the literal retriever forward so that
-            # Stage 6.5 can surface the exact matched span without re-discovery.
-            if retriever == "literal" and hit.get("literal_matches"):
+            # Propagate exact matched spans forward so context_expander/Stage 6.5 can
+            # resolve the containing object without re-discovery. Not literal-only: any
+            # retriever that finds a precise span in raw_text (literal, regex, future
+            # additions) feeds the same accumulator via this field-name map.
+            match_field = _EXACT_MATCH_FIELD_BY_RETRIEVER.get(retriever)
+            if match_field and hit.get(match_field):
                 existing_starts = {m["start"] for m in entry["literal_matches"]}
-                for lm in hit["literal_matches"]:
+                for lm in hit[match_field]:
                     if lm["start"] not in existing_starts:
                         entry["literal_matches"].append(lm)
                         existing_starts.add(lm["start"])
