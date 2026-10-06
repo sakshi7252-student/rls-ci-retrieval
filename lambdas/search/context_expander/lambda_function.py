@@ -555,9 +555,21 @@ def _build_expanded_candidate(
     )
     selection_reason = "retriever_direct" if origin == "direct" else "chunk_fanout"
 
+    # The candidate's page_start/page_end/match_page start out as the CONTAINING CHUNK's
+    # page range (set by the retriever, e.g. literal_retriever's hit.page_start/page_end).
+    # A chunk spans multiple pages, so a fanned-out object partway through it (e.g. a
+    # sentence on page 26 of a page 24-26 chunk) would otherwise stay mislabeled under the
+    # chunk's first page — resolving the real object means we know its true page, so use it.
+    obj_page = obj.get("page")
+    page_start = obj_page if isinstance(obj_page, int) else candidate.get("page_start", 0)
+    page_end   = obj_page if isinstance(obj_page, int) else candidate.get("page_end", 0)
+
     return {
         **candidate,
         "matched_object":     obj,
+        "page_start":         page_start,
+        "page_end":           page_end,
+        "match_page":         obj_page if isinstance(obj_page, int) else candidate.get("match_page"),
         "retrieval_origin":   retrieval_origin,
         "selection_reason":   selection_reason,
         "resolution_status":  "resolved",
