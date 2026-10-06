@@ -526,19 +526,24 @@ def _s6_llm_verify(req: dict, skip_verify: bool = False) -> dict:
         call_times: list[float] = []
         call_tokens: list[dict] = []
         # module is now cached per-thread (see _load_fresh) — remember the true
-        # original once so repeated monkey-patching doesn't nest wrappers
-        if not hasattr(verifier, "_verify_orig"):
-            verifier._verify_orig = verifier._verify
-        orig = verifier._verify_orig
+        # original once so repeated monkey-patching doesn't nest wrappers.
+        # Wrap _invoke (the real Bedrock call), not _verify — _process routes
+        # through _verify_batch/_verify_chunk/_verify_one, all of which call
+        # _invoke directly; _verify itself is dead code on this path and was
+        # never actually hit, which silently zeroed out every token/timing stat.
+        if not hasattr(verifier, "_invoke_orig"):
+            verifier._invoke_orig = verifier._invoke
+        orig = verifier._invoke_orig
 
         def _timed(*a, **kw):
             _t = time.perf_counter()
             _r = orig(*a, **kw)
             call_times.append(round(time.perf_counter() - _t, 3))
-            call_tokens.append(_r.get("_tokens", {"input": 0, "output": 0}))
+            _, in_tok, out_tok = _r
+            call_tokens.append({"input": in_tok, "output": out_tok})
             return _r
 
-        verifier._verify = _timed
+        verifier._invoke = _timed
         req = verifier._process(req)
         req["_st"]["per_verifier_call_s"]    = {i + 1: t for i, t in enumerate(call_times)}
         req["_st"]["actual_verifier_tokens"] = {
@@ -806,7 +811,8 @@ def _save_results_debug_s3(all_results: list[dict], event, wall_time: float = 0.
     }
 
     # ── Timing + cost summary ─────────────────────────────────────────────────
-    all_t = [r.get("timings", {}) for r in all_results]
+    # Stage functions populate req["_st"], not req["timings"] — that key is never set.
+    all_t = [r.get("_st", {}) for r in all_results]
     n     = len(all_results) or 1
 
     def _agg_t(key: str) -> dict:
@@ -1337,7 +1343,7 @@ def _clean_result(result: dict,debug: bool = False) -> dict:
             "ce_histogram":     result.get("ce_histogram"),
         } if debug else {}),
 
-        "timings":          result.get("timings", {}),
+        "timings":          result.get("_st", {}),
         "highlight_mode":   result.get("highlight_mode", "span"),
     }
 
@@ -1368,6 +1374,10 @@ def _strip_vectors(obj: dict | list | str | int | float | bool | None) -> dict |
     if isinstance(obj, dict):
         result = {}
         for k, v in obj.items():
+            # per_verifier_call_s / per_ec_call_s use int keys (call index) — not strippable by name.
+            if not isinstance(k, str):
+                result[k] = _strip_vectors(v)
+                continue
             k_lower = k.lower()
             
             # Skip if key matches vector patterns (case-insensitive)
