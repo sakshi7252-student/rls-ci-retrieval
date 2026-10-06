@@ -877,7 +877,6 @@ def _save_results_debug_s3(all_results: list[dict], event, wall_time: float = 0.
         "model": VERIFIER_MODEL,
         "llm_verifier": {
             "candidates_passed_to_verifier": n_to_verifier,
-            "skipped_below_threshold":        n_to_verifier - n_actual_calls,
             "actual_bedrock_calls":           n_actual_calls,
             "input_tokens":                  v_in,
             "output_tokens":                 v_out,
