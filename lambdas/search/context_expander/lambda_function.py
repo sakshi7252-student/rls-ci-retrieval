@@ -77,6 +77,11 @@ OPENSEARCH_MAXSIZE  = int(os.environ.get("OPENSEARCH_MAXSIZE", "256"))
 # past this for containers with more objects than the page, so "full table"/"full list"
 # holds regardless of container size. Not a hard cap.
 CONTAINER_CONTEXT_PAGE_SIZE = int(os.environ.get("CONTAINER_CONTEXT_PAGE_SIZE", "200"))
+# Hard cap on total objects paginated for a single table/list container. Formatting already
+# truncates at TABLE_CONTEXT_MAX_CHARS, so a table/list beyond this size was always going to
+# be cut off in the output anyway — this just stops paying the OpenSearch + memory cost of
+# fetching objects that never make it into the formatted context.
+CONTAINER_CONTEXT_MAX_OBJECTS = int(os.environ.get("CONTAINER_CONTEXT_MAX_OBJECTS", "2000"))
 TABLE_CONTEXT_MAX_CHARS = int(os.environ.get("TABLE_CONTEXT_MAX_CHARS", "16000"))
 CONTEXT_EXPANDER_WORKERS = int(os.environ.get("CONTEXT_EXPANDER_WORKERS", "1"))
 # Objects fetched per chunk for chunk-level (via_chunk) candidates. The old hard-coded 100 cut off
@@ -86,12 +91,44 @@ CHUNK_OBJECTS_MAX = int(os.environ.get("CHUNK_OBJECTS_MAX", "400"))
 CHUNK_TEXT_MAX_CHARS = int(os.environ.get("CHUNK_TEXT_MAX_CHARS", "8000"))
 # prev/next for an anchored object = this many same-type neighbouring objects each side.
 NEIGHBOR_OBJECTS = int(os.environ.get("NEIGHBOR_OBJECTS", "2"))
+# Global per-CI cap on expanded candidates. Direct candidates are always kept in full; this
+# only trims chunk-fanout (which can blow up to tens of thousands of objects for table-heavy
+# chunks) down to the highest-priority objects BEFORE the expensive context/table-fetch work.
+MAX_EXPANDED_CANDIDATES = int(os.environ.get("MAX_EXPANDED_CANDIDATES", "1000"))
 # 1 = also attach adjacent-CHUNK text to anchored objects (old behaviour; causes cross-chunk bleed).
 CHUNK_NEIGHBORS_FOR_ANCHORED = os.environ.get("CHUNK_NEIGHBORS_FOR_ANCHORED", "0") == "1"
 
 def _get_os():
     from shared.opensearch_client import get_opensearch_client
     return get_opensearch_client()
+
+
+# Cross-CI cache for table/list container fetches — every CI in a batch shares the same
+# document_id, and CIs frequently hit the same tables (e.g. a demographics/sample-size
+# table matched by several numeric CIs), so without this each CI independently re-fetches
+# and re-holds a full copy of the same tens-of-thousands-of-objects table in memory.
+# Scoped to the current document_id only — reset on a new document so a warm container
+# reused across documents never serves stale data.
+_CONTAINER_CACHE_DOC_ID: str | None = None
+_TABLE_CACHE: dict[str, list[dict]] = {}
+_LIST_CACHE: dict[str, list[dict]] = {}
+# Rendered-text cache: fan-out means many expanded candidates can share the same
+# table_id (often the same row_index too — a table_row object + several table_cell
+# objects from one row all land in the same chunk). Without this, _build_table_context
+# reformats and duplicates the ENTIRE table string once per fanned-out object — for a
+# 189-table document this is the dominant memory cost, not the container fetch itself.
+# Keyed by (table_id, matched_row_index) since that's the only thing that changes the
+# rendered output (matched row is bubbled to the front).
+_TABLE_TEXT_CACHE: dict[tuple[str, int | None], str] = {}
+
+
+def _reset_container_cache_if_new_document(document_id: str) -> None:
+    global _CONTAINER_CACHE_DOC_ID
+    if document_id != _CONTAINER_CACHE_DOC_ID:
+        _TABLE_CACHE.clear()
+        _LIST_CACHE.clear()
+        _TABLE_TEXT_CACHE.clear()
+        _CONTAINER_CACHE_DOC_ID = document_id
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -119,6 +156,8 @@ def _process(req: dict) -> dict:
 
     if not candidates:
         return {**req, "expanded_candidates": []}
+
+    _reset_container_cache_if_new_document(document_id)
 
     # ── Phase 1: collect all lookup keys ──────────────────────────────────────
     primary_ids:  list[str]                          = []
@@ -205,32 +244,55 @@ def _process(req: dict) -> dict:
     # semantic object indexed under that chunk (fan-out), not a single guessed object. The
     # only candidate that can leave this phase without a matched_object is one whose chunk
     # genuinely has zero indexed semantic objects — an indexing gap, not ambiguity to resolve.
-    pending: list[tuple[dict, dict | None, list[dict], str]] = []
-    extra_table_ids: set[str] = set()
-    extra_list_ids: set[str] = set()
+    direct_pending: list[tuple[dict, dict | None, list[dict], str]] = []
+    fanout_scored: list[tuple[tuple, dict, dict, list[dict]]] = []  # (sort_key, candidate, obj, pool)
     for c in candidates:
         direct_obj = c.get("matched_object")
         if direct_obj:
-            pool   = ctx_cache.get((c.get("chunk_id", ""), direct_obj.get("global_position")), [])
-            objs   = [direct_obj]
-            origin = "direct"
-        else:
-            pool   = ctx_cache.get((c.get("chunk_id", ""), None), [])
-            objs   = _dedupe_fanout_objects(pool)
-            origin = "fanout"
-
-        if not objs:
-            pending.append((c, None, pool, "unresolved"))
+            pool = ctx_cache.get((c.get("chunk_id", ""), direct_obj.get("global_position")), [])
+            direct_pending.append((c, direct_obj, pool, "direct"))
             continue
+
+        pool = ctx_cache.get((c.get("chunk_id", ""), None), [])
+        objs = _dedupe_fanout_objects(pool)
+        if not objs:
+            direct_pending.append((c, None, pool, "unresolved"))
+            continue
+        agg_score = c.get("agg_score") or 0.0
         for o in objs:
-            otype = o.get("type")
-            tid = o.get("table_id")
-            if tid and otype in _TABLE_TYPES and str(tid) not in table_cache:
-                extra_table_ids.add(str(tid))
-            lid = o.get("list_id")
-            if lid and otype in _LIST_TYPES and str(lid) not in list_cache:
-                extra_list_ids.add(str(lid))
-            pending.append((c, o, pool, origin))
+            # Retrieval relevance (originating chunk's own score) is the primary signal;
+            # object type only breaks ties within equally-relevant chunks — otherwise every
+            # heading from a weak chunk would outrank a sentence from a strong one.
+            type_rank = _FANOUT_TYPE_PRIORITY.get(o.get("type"), 7)
+            sort_key = (-agg_score, type_rank, c.get("chunk_id", ""), o.get("global_position") or 0)
+            fanout_scored.append((sort_key, c, o, pool))
+
+    # Global per-CI cap: direct candidates are never trimmed; fan-out objects are ranked by
+    # type priority then by their originating chunk's own retrieval score, and truncated HERE —
+    # before _build_expanded_candidate/table-fetch — so the cap actually saves the work, not
+    # just the output size.
+    fanout_budget = max(MAX_EXPANDED_CANDIDATES - len(direct_pending), 0)
+    if len(fanout_scored) > fanout_budget:
+        fanout_scored.sort(key=lambda t: t[0])
+        logger.info(
+            "[Context Expander] search_id=%s  fanout_cap=%d  fanout_total=%d  dropped=%d",
+            req.get("search_id"), MAX_EXPANDED_CANDIDATES, len(fanout_scored),
+            len(fanout_scored) - fanout_budget,
+        )
+        fanout_scored = fanout_scored[:fanout_budget]
+
+    pending: list[tuple[dict, dict | None, list[dict], str]] = list(direct_pending)
+    extra_table_ids: set[str] = set()
+    extra_list_ids: set[str] = set()
+    for _, c, o, pool in fanout_scored:
+        otype = o.get("type")
+        tid = o.get("table_id")
+        if tid and otype in _TABLE_TYPES and str(tid) not in table_cache:
+            extra_table_ids.add(str(tid))
+        lid = o.get("list_id")
+        if lid and otype in _LIST_TYPES and str(lid) not in list_cache:
+            extra_list_ids.add(str(lid))
+        pending.append((c, o, pool, "fanout"))
 
     # Fanned-out/direct objects can reference tables/lists Phase 1 never saw (it only scans
     # the candidate's own matched_object table_id/list_id, which chunk-level candidates don't
@@ -327,6 +389,19 @@ def _sort_context_objects(
 _TABLE_TYPES = {"table_header", "table_row", "table_cell"}
 _LIST_TYPES  = {"list_item", "list"}
 
+# Fan-out prioritization when over MAX_EXPANDED_CANDIDATES: prose-like objects first (most
+# likely to carry unique evidence), table_cell last (its text is mostly already covered by
+# its own table_row — see _format_table_context's row-preferred rendering).
+_FANOUT_TYPE_PRIORITY = {
+    "heading":      0,
+    "sentence":     1,
+    "paragraph":    2,
+    "table_row":    3,
+    "table_header": 4,
+    "list_item":    5,
+    "table_cell":   6,
+}
+
 
 
 def _local_neighbors(
@@ -385,13 +460,19 @@ def _build_table_context(obj: dict, context_objects: list[dict], table_cache: di
     if not table_id:
         warning = "table_object_missing_table_id"
     else:
-        table_objs = table_cache.get(str(table_id)) or [
-            x for x in context_objects if x.get("table_id") == table_id
-        ]
-        if table_objs:
-            table_text = _format_table_context(table_objs, obj)
-        else:
-            warning = "table_fetch_empty"
+        matched_row_index = obj.get("row_index") if isinstance(obj.get("row_index"), int) else None
+        cache_key = (str(table_id), matched_row_index)
+        table_text = _TABLE_TEXT_CACHE.get(cache_key)
+        if table_text is None:
+            table_objs = table_cache.get(str(table_id)) or [
+                x for x in context_objects if x.get("table_id") == table_id
+            ]
+            if table_objs:
+                table_text = _format_table_context(table_objs, obj)
+                _TABLE_TEXT_CACHE[cache_key] = table_text
+            else:
+                table_text = ""
+                warning = "table_fetch_empty"
     return {
         **_EMPTY_CONTEXT,
         "context_strategy":  "table_full" if table_text else "table_incomplete",
@@ -783,18 +864,23 @@ def _fetch_table_context(document_id: str, table_ids: list[str], tenant_id: str 
     """
     if not document_id or not table_ids:
         return {}
-    body: list[dict] = []
-    source_fields = [
-        "object_id", "document_id", "parent_chunk_id", "global_position",
-        "type", "text",
-        # Canonical table relationships.
-        "table_id", "table_role", "row_index",
-        "cell_id", "row_start", "col_start", "row_span", "col_span",
-        # Canonical list relationships for list_item objects inside cells.
-        "list_id", "list_level", "list_label", "list_number_format",
-        "heading_path", "semantic_path",
-    ]
+
+    result: dict[str, list[dict]] = {}
+    to_fetch = []
     for table_id in table_ids:
+        cached = _TABLE_CACHE.get(table_id)
+        if cached is not None:
+            result[table_id] = cached
+        else:
+            to_fetch.append(table_id)
+    if not to_fetch:
+        return result
+
+    body: list[dict] = []
+    # Only fields _format_table_context/_paginate_container_objects actually read —
+    # row_index/col_start for grid ordering, global_position as the pagination cursor.
+    source_fields = ["global_position", "type", "text", "row_index", "col_start"]
+    for table_id in to_fetch:
         body.append({})
         body.append({
             "size": CONTAINER_CONTEXT_PAGE_SIZE,
@@ -813,21 +899,25 @@ def _fetch_table_context(document_id: str, table_ids: list[str], tenant_id: str 
         })
     try:
         resp = _get_os().msearch(body=body, index=SEMANTIC_OBJECTS_INDEX)
-        result: dict[str, list[dict]] = {}
+        fetched: dict[str, list[dict]] = {}
         responses = resp.get("responses", [])
-        for i, table_id in enumerate(table_ids):
+        for i, table_id in enumerate(to_fetch):
             if i >= len(responses):
-                result[table_id] = []
+                fetched[table_id] = []
                 continue
-            result[table_id] = [h.get("_source", {}) for h in responses[i].get("hits", {}).get("hits", [])]
+            fetched[table_id] = [h.get("_source", {}) for h in responses[i].get("hits", {}).get("hits", [])]
         # CONTAINER_CONTEXT_PAGE_SIZE is a page size, not a hard cap — page past it so "full
         # table" holds even for tables with more objects than the limit.
-        result = _paginate_container_objects(result, document_id, "table_id", CONTAINER_CONTEXT_PAGE_SIZE, tenant_id, project_id)
-        logger.info("[Context Expander] table_context tables=%d objects=%d", len(table_ids), sum(len(v) for v in result.values()))
+        fetched = _paginate_container_objects(fetched, document_id, "table_id", CONTAINER_CONTEXT_PAGE_SIZE, tenant_id, project_id)
+        logger.info("[Context Expander] table_context tables=%d objects=%d (cached=%d)", len(to_fetch), sum(len(v) for v in fetched.values()), len(table_ids) - len(to_fetch))
+        _TABLE_CACHE.update(fetched)
+        result.update(fetched)
         return result
     except Exception as exc:
         logger.warning("[Context Expander] table context msearch failed: %s", exc)
-        return {table_id: [] for table_id in table_ids}
+        for table_id in to_fetch:
+            result[table_id] = []
+        return result
 
 
 def _fetch_list_context(document_id: str, list_ids: list[str], tenant_id: str | None = None, project_id: str | None = None) -> dict[str, list[dict]]:
@@ -838,14 +928,22 @@ def _fetch_list_context(document_id: str, list_ids: list[str], tenant_id: str | 
     """
     if not document_id or not list_ids:
         return {}
-    body: list[dict] = []
-    source_fields = [
-        "object_id", "document_id", "parent_chunk_id", "global_position",
-        "type", "text",
-        "list_id", "list_level", "list_label", "list_number_format",
-        "heading_path", "semantic_path",
-    ]
+
+    result: dict[str, list[dict]] = {}
+    to_fetch = []
     for list_id in list_ids:
+        cached = _LIST_CACHE.get(list_id)
+        if cached is not None:
+            result[list_id] = cached
+        else:
+            to_fetch.append(list_id)
+    if not to_fetch:
+        return result
+
+    body: list[dict] = []
+    # Only fields _format_list_context/_paginate_container_objects actually read.
+    source_fields = ["global_position", "type", "text"]
+    for list_id in to_fetch:
         body.append({})
         body.append({
             "size": CONTAINER_CONTEXT_PAGE_SIZE,
@@ -860,21 +958,25 @@ def _fetch_list_context(document_id: str, list_ids: list[str], tenant_id: str | 
         })
     try:
         resp = _get_os().msearch(body=body, index=SEMANTIC_OBJECTS_INDEX)
-        result: dict[str, list[dict]] = {}
+        fetched: dict[str, list[dict]] = {}
         responses = resp.get("responses", [])
-        for i, list_id in enumerate(list_ids):
+        for i, list_id in enumerate(to_fetch):
             if i >= len(responses):
-                result[list_id] = []
+                fetched[list_id] = []
                 continue
-            result[list_id] = [h.get("_source", {}) for h in responses[i].get("hits", {}).get("hits", [])]
+            fetched[list_id] = [h.get("_source", {}) for h in responses[i].get("hits", {}).get("hits", [])]
         # CONTAINER_CONTEXT_PAGE_SIZE is a page size here too — page past it so "full list"
         # holds even for lists with more objects than the limit.
-        result = _paginate_container_objects(result, document_id, "list_id", CONTAINER_CONTEXT_PAGE_SIZE, tenant_id, project_id)
-        logger.info("[Context Expander] list_context lists=%d objects=%d", len(list_ids), sum(len(v) for v in result.values()))
+        fetched = _paginate_container_objects(fetched, document_id, "list_id", CONTAINER_CONTEXT_PAGE_SIZE, tenant_id, project_id)
+        logger.info("[Context Expander] list_context lists=%d objects=%d (cached=%d)", len(to_fetch), sum(len(v) for v in fetched.values()), len(list_ids) - len(to_fetch))
+        _LIST_CACHE.update(fetched)
+        result.update(fetched)
         return result
     except Exception as exc:
         logger.warning("[Context Expander] list context msearch failed: %s", exc)
-        return {list_id: [] for list_id in list_ids}
+        for list_id in to_fetch:
+            result[list_id] = []
+        return result
 
 
 def _mget_chunks(chunk_ids: list[str]) -> dict[str, dict]:
@@ -1001,17 +1103,62 @@ def _paginate_container_objects(
 ) -> dict[str, list[dict]]:
     """Page past `page_size` for every container (table/list) whose initial fetch hit the
     cap exactly — so "full table"/"full list" holds even for containers with >page_size
-    objects, instead of silently truncating."""
-    for key, objs in initial.items():
-        last_batch_size = len(objs)
-        while last_batch_size == page_size:
-            last_pos = objs[-1].get("global_position") if objs else None
+    objects, instead of silently truncating. Stops at CONTAINER_CONTEXT_MAX_OBJECTS total
+    per container; formatting truncates well before that anyway, so this only avoids
+    fetching/holding objects that would never reach the formatted output.
+
+    Batches ALL containers still needing another page into a single msearch per round
+    (round-robin), instead of one sequential _search per container per round — with ~190
+    tables needing a 2nd/3rd page on a large document, the old per-container loop meant
+    100+ serial network round-trips (the actual S4 wall-time driver, separate from the
+    memory issue)."""
+    pending = {
+        key for key, objs in initial.items()
+        if len(objs) == page_size and len(objs) < CONTAINER_CONTEXT_MAX_OBJECTS
+    }
+    while pending:
+        body: list[dict] = []
+        keys: list[str] = []
+        for key in pending:
+            last_pos = initial[key][-1].get("global_position") if initial[key] else None
             if last_pos is None:
-                break
-            more = _fetch_objects_page(filter_field, key, document_id, last_pos, tenant_id, project_id, size=page_size)
-            objs.extend(more)
-            last_batch_size = len(more)
-        initial[key] = objs
+                continue
+            keys.append(key)
+            body.append({})
+            body.append({
+                "size": page_size,
+                "query": {"bool": {"filter": [
+                    {"term":  {filter_field: key}},
+                    {"range": {"global_position": {"gt": last_pos}}},
+                    *([{"term": {"document_id": document_id}}] if document_id else []),
+                    *([{"term": {"tenant_id": tenant_id}}] if tenant_id else []),
+                    *([{"term": {"project_id": project_id}}] if project_id else []),
+                ]}},
+                "sort": [{"global_position": "asc"}],
+            })
+        if not keys:
+            break
+        try:
+            resp = _get_os().msearch(body=body, index=SEMANTIC_OBJECTS_INDEX)
+            responses = resp.get("responses", [])
+        except Exception as exc:
+            logger.warning("[Context Expander] %s batched pagination failed: %s", filter_field, exc)
+            break
+
+        next_pending: set[str] = set()
+        for key, r in zip(keys, responses):
+            more = [h["_source"] for h in r.get("hits", {}).get("hits", [])]
+            initial[key].extend(more)
+            if len(more) == page_size and len(initial[key]) < CONTAINER_CONTEXT_MAX_OBJECTS:
+                next_pending.add(key)
+        pending = next_pending
+
+    for key, objs in initial.items():
+        if len(objs) >= CONTAINER_CONTEXT_MAX_OBJECTS:
+            logger.warning(
+                "[Context Expander] %s=%s hit CONTAINER_CONTEXT_MAX_OBJECTS=%d — truncating fetch",
+                filter_field, key, CONTAINER_CONTEXT_MAX_OBJECTS,
+            )
     return initial
 
 
