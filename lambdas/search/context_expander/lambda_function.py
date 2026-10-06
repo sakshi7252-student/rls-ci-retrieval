@@ -81,7 +81,7 @@ CONTAINER_CONTEXT_PAGE_SIZE = int(os.environ.get("CONTAINER_CONTEXT_PAGE_SIZE", 
 # truncates at TABLE_CONTEXT_MAX_CHARS, so a table/list beyond this size was always going to
 # be cut off in the output anyway — this just stops paying the OpenSearch + memory cost of
 # fetching objects that never make it into the formatted context.
-CONTAINER_CONTEXT_MAX_OBJECTS = int(os.environ.get("CONTAINER_CONTEXT_MAX_OBJECTS", "2000"))
+CONTAINER_CONTEXT_MAX_OBJECTS = int(os.environ.get("CONTAINER_CONTEXT_MAX_OBJECTS", "200"))
 TABLE_CONTEXT_MAX_CHARS = int(os.environ.get("TABLE_CONTEXT_MAX_CHARS", "16000"))
 CONTEXT_EXPANDER_WORKERS = int(os.environ.get("CONTEXT_EXPANDER_WORKERS", "1"))
 # Objects fetched per chunk for chunk-level (via_chunk) candidates. The old hard-coded 100 cut off
@@ -94,7 +94,7 @@ NEIGHBOR_OBJECTS = int(os.environ.get("NEIGHBOR_OBJECTS", "2"))
 # Global per-CI cap on expanded candidates. Direct candidates are always kept in full; this
 # only trims chunk-fanout (which can blow up to tens of thousands of objects for table-heavy
 # chunks) down to the highest-priority objects BEFORE the expensive context/table-fetch work.
-MAX_EXPANDED_CANDIDATES = int(os.environ.get("MAX_EXPANDED_CANDIDATES", "1000"))
+MAX_EXPANDED_CANDIDATES = int(os.environ.get("MAX_EXPANDED_CANDIDATES", "500"))
 # 1 = also attach adjacent-CHUNK text to anchored objects (old behaviour; causes cross-chunk bleed).
 CHUNK_NEIGHBORS_FOR_ANCHORED = os.environ.get("CHUNK_NEIGHBORS_FOR_ANCHORED", "0") == "1"
 
