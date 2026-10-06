@@ -40,6 +40,8 @@ Env vars
 
 from __future__ import annotations
 
+import ctypes
+import gc
 import importlib.util
 import json
 import logging
@@ -153,8 +155,13 @@ SEARCH_RESULTS_DEBUG_BUCKET = os.environ.get("SEARCH_RESULTS_DEBUG_BUCKET", "rls
 RESULTS_DEBUG_PREFIX   = os.environ.get("RESULTS_DEBUG_PREFIX", "search-results")
 # Leaves headroom under the hard 6,291,556 byte Lambda sync-invoke response cap.
 WORKER_RESPONSE_INLINE_LIMIT_BYTES = int(os.environ.get("WORKER_RESPONSE_INLINE_LIMIT_BYTES", "5000000"))
+# Identifies this execution environment (set once at import/cold-start) so
+# CloudWatch logs can tell a reused warm container from a fresh one.
+EXECUTION_ENV_ID = uuid.uuid4().hex
+COLD_START_TS = datetime.now().isoformat()
 # ── Lazy singletons ────────────────────────────────────────────────────────────
 _loaded: dict[str, types.ModuleType] = {}
+_loaded_fresh: dict[tuple[str, int], types.ModuleType] = {}  # per-thread cache for _load_fresh
 _evidence_classifier = None  # Lazy load for evidence classification
 
 
@@ -187,7 +194,11 @@ def _load(rel_path: str, alias: str) -> types.ModuleType:
 
 
 def _load_fresh(rel_path: str) -> types.ModuleType:
-    """Fresh uncached module so each thread can safely monkey-patch."""
+    """One exec'd module per thread, cached — re-execing per CI leaked a boto3
+    client + module globals on every call, compounding across warm invocations."""
+    cache_key = (rel_path, threading.get_ident())
+    if cache_key in _loaded_fresh:
+        return _loaded_fresh[cache_key]
     lf_path = ROOT / "lambdas" / rel_path / "lambda_function.py"
     alias   = f"_fresh_{rel_path.replace('/', '_')}_{threading.get_ident()}"
     spec    = importlib.util.spec_from_file_location(alias, lf_path)
@@ -196,6 +207,7 @@ def _load_fresh(rel_path: str) -> types.ModuleType:
     if lf_dir not in sys.path:
         sys.path.insert(0, lf_dir)
     spec.loader.exec_module(mod)
+    _loaded_fresh[cache_key] = mod
     return mod
 
 
@@ -495,7 +507,11 @@ def _s6_llm_verify(req: dict, skip_verify: bool = False) -> dict:
         _inject_os(verifier)
         call_times: list[float] = []
         call_tokens: list[dict] = []
-        orig = verifier._verify
+        # module is now cached per-thread (see _load_fresh) — remember the true
+        # original once so repeated monkey-patching doesn't nest wrappers
+        if not hasattr(verifier, "_verify_orig"):
+            verifier._verify_orig = verifier._verify
+        orig = verifier._verify_orig
 
         def _timed(*a, **kw):
             _t = time.perf_counter()
@@ -1414,7 +1430,41 @@ def _upload_results_to_s3(results: list, search_id: str, batch_idx: int, documen
 
 # ── Lambda handler ─────────────────────────────────────────────────────────────
 
-def handler(event: dict, context: Any) -> dict:
+# Delay before the self-destruct thread kills the process — must be long enough
+# for the Lambda runtime to finish flushing our `return` value back over the
+# Runtime API before the process dies (killing it synchronously pre-return
+# would drop the response, not just the container).
+
+
+def _current_rss_mb() -> float:
+    """Current (not peak) resident memory, read from /proc so it reflects
+    what's actually held right now rather than the invocation's high-water mark."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    except Exception:
+        pass
+    return 0.0
+
+
+def _cleanup_memory() -> None:
+    """Release everything that could carry over into the next invocation on a
+    reused warm container: per-module caches, the per-thread fresh-module
+    cache, and any heap pages freed by gc that glibc would otherwise keep."""
+    global _evidence_classifier
+    _loaded.clear()
+    _loaded_fresh.clear()
+    _evidence_classifier = None
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _handle_invocation(event: dict, context: Any) -> dict:
     search_id   = event.get("search_id", str(uuid.uuid4()))
     batch_idx   = event.get("batch_idx", 0)
     enriched_cis = event.get("cis", [])
@@ -1468,6 +1518,10 @@ def handler(event: dict, context: Any) -> dict:
         }
         for i, ci in enumerate(enriched_cis)
     ]
+    # enriched_cis's ci dicts (with embeddings) now live inside all_reqs too —
+    # drop this extra reference so it doesn't outlive all_reqs's own cleanup.
+    n_cis_total = len(enriched_cis)
+    del enriched_cis
 
     t_total = time.perf_counter()
     all_reqs, stage_wall = _run_pipeline(all_reqs, skip_rerank, skip_verify, n_workers, tenant)
@@ -1489,21 +1543,30 @@ def handler(event: dict, context: Any) -> dict:
         })
     
     # NOW save debug JSON with complete failure information
-    s3_url = _save_results_debug_s3(all_reqs, event, wall_time, len(enriched_cis), 
+    s3_url = _save_results_debug_s3(all_reqs, event, wall_time, n_cis_total,
                                      len(completed_cis), len(failed_cis), ci_failures)
     
     # ── Simple return to orchestrator ──────────────────────────────────────────
     results = [_build_result(r) for r in completed_cis]  # Only return completed CIs
     total_hits = sum(len(r.get("final_hits", [])) for r in results)
-    
+
+    # all_reqs/completed_cis/failed_cis carry every stage's full intermediate
+    # data (candidates, expanded_candidates, matched_object, context) for every
+    # CI — nothing downstream needs them once `results` is built, so capture
+    # their counts and drop the references now rather than waiting for
+    # end-of-invocation cleanup.
+    n_completed, n_failed = len(completed_cis), len(failed_cis)
+    del all_reqs, completed_cis, failed_cis
+    gc.collect()
+
     # Build response
     response = {
         "document_id":   document_id,
         "search_id":     search_id,
         "batch_idx":     batch_idx,
-        "n_cis":         len(enriched_cis),
-        "completed_cis": len(completed_cis),
-        "failed_cis":    len(failed_cis),
+        "n_cis":         n_cis_total,
+        "completed_cis": n_completed,
+        "failed_cis":    n_failed,
         "ci_failures":   ci_failures,  # NEW: detailed failure info
         "results":       results,
         "stage_wall":    stage_wall,
@@ -1517,6 +1580,9 @@ def handler(event: dict, context: Any) -> dict:
     pre_strip_size = len(json.dumps(response, default=str).encode())
     
     response = _strip_vectors(response)
+    # response now owns its own (stripped) copy of what `results` held —
+    # drop the pre-strip reference instead of letting it ride out the function.
+    del results
     
     post_strip_size = len(json.dumps(response, default=str).encode())
     reduction_pct = round(100 * (1 - post_strip_size / max(pre_strip_size, 1)), 1)
@@ -1526,7 +1592,7 @@ def handler(event: dict, context: Any) -> dict:
         "cis_total=%d completed=%d failed=%d hits=%d "
         "payload_before_strip=%d bytes payload_after_strip=%d bytes reduction=%.1f%%",
         wall_time,
-        len(enriched_cis), len(completed_cis), len(failed_cis), total_hits,
+        n_cis_total, n_completed, n_failed, total_hits,
         pre_strip_size, post_strip_size, reduction_pct
     )
 
@@ -1547,3 +1613,20 @@ def handler(event: dict, context: Any) -> dict:
         response["results_s3_url"] = results_s3_url
 
     return response
+
+
+def handler(event: dict, context: Any) -> dict:
+    """Thin wrapper: run the invocation, then explicitly release module-level
+    caches so a reused warm container starts the next invocation clean. No
+    forced os._exit() - we rely on this cleanup plus RSS telemetry instead."""
+    logger.info(
+        "[Runtime] env_id=%s pid=%s cold_start=%s",
+        EXECUTION_ENV_ID, os.getpid(), COLD_START_TS,
+    )
+    logger.info("[Memory] START pid=%s rss_mb=%.1f", os.getpid(), _current_rss_mb())
+    try:
+        return _handle_invocation(event, context)
+    finally:
+        logger.info("[Memory] BEFORE_CLEANUP rss_mb=%.1f", _current_rss_mb())
+        _cleanup_memory()
+        logger.info("[Memory] AFTER_CLEANUP rss_mb=%.1f", _current_rss_mb())
