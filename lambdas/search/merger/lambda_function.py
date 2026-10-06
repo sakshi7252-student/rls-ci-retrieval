@@ -88,7 +88,13 @@ def _process(req: dict) -> dict:
     ci_id = ci.get("id", ci.get("ci_id", ""))
     ci_text = ci.get("knownCI", "")
     verified = req.get("verified_candidates", [])
-    accepted = [c for c in verified if c.get("verdict") in ("YES", "MAYBE")]
+    # Hard invariant: no semantic object -> no final_hit. S5 already gates unresolved
+    # candidates before the LLM, but this is enforced here too (defense-in-depth) since
+    # final_hits is the one place the UI reads geometry from to highlight evidence.
+    accepted = [
+        c for c in verified
+        if c.get("verdict") in ("YES", "MAYBE") and c.get("matched_object")
+    ]
     final_hits = _build_individual_hits(ci_id, ci_text, accepted)
     return {**req, "final_hits": final_hits}
 

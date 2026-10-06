@@ -1,10 +1,15 @@
 """
-Search Pipeline — Stage 4: Context Expander
-=============================================
-For each candidate chunk, fetches the chunk's text from OpenSearch and
-retrieves neighbouring chunks (±1 page range) to provide surrounding context.
+Search Pipeline — Stage 4: Context Expander (v2 — context-only)
+=================================================================
+Pure context assembly. All candidate-cardinality decisions ("which semantic object does
+this retrieval hit mean?") happen upstream in Stage 3.5, the Evidence Grounder
+(lambdas/search/evidence_grounder) — this stage never changes candidate count:
 
-Input:  aggregated search request  (must have "candidates")
+    len(expanded_candidates) == len(grounded_candidates)   # enforced below
+
+Input:  grounded search request (must have "grounded_candidates", produced by the Evidence
+        Grounder; falls back to "candidates" for callers that already pass pre-grounded
+        object-level hits, e.g. standalone tests)
 Appends: "expanded_candidates": list[ExpandedCandidate]
 
 ExpandedCandidate schema
@@ -33,26 +38,25 @@ ExpandedCandidate schema
         "neighbor_kind":    str,  # "object": prev/next are the matched object's own neighbours
                                   # "chunk":  prev/next are the adjacent chunks (unanchored candidates)
     },
-    "anchored":          bool,  # True for every normally-resolved candidate (direct hit or a real,
-                                # fanned-out semantic object). False only for "unresolved" candidates.
+    "anchored":          bool,  # True for every grounded candidate. False only for "unresolved".
     "unanchored_reason": str|None,  # set only when resolution_status == "unresolved"
-    "resolution_status": str,       # "resolved" | "unresolved" (chunk had zero indexed semantic objects)
-    "resolution_reason": str|None,  # e.g. "no_semantic_objects_for_chunk"
+    "resolution_status": str,       # "resolved" | "unresolved"
+    "resolution_reason": str|None,  # "no_semantic_objects_for_chunk" | "no_reliable_anchor"
+    "grounding":         dict,      # passed through from the Evidence Grounder unchanged
     "context_complete":  bool,      # False when a table_*/list* object's full context couldn't be built
     "context_warning":   str|None,  # e.g. "table_object_missing_table_id", "table_fetch_empty"
 }
 
 Context Expander invariants:
-  1. Every "resolved" candidate has matched_object != None.
-  2. Context selection depends ONLY on matched_object.type, never on retrieval origin
-     (direct hit vs chunk fan-out) — see _expand_object_context()'s dispatch.
+  1. Candidate count in == candidate count out, always (asserted in _process).
+  2. Context selection depends ONLY on matched_object.type — see _expand_object_context().
   3. table_* objects always attempt full table context via table_id; context_complete=False
      (never a silent fallback) if table_id is missing or the table fetch is empty.
   4. list_item (and, if ever indexed, "list") objects always attempt full list context via
      list_id, with the same non-silent completeness rule as tables.
   5. sentence objects get sentence+parent-paragraph+neighbour-sentence context.
-  6. Zero semantic objects for a chunk is an indexing gap, not ambiguity — stays
-     resolution_status="unresolved", never a fabricated matched_object.
+  6. An "unresolved" candidate (from the Grounder) is surfaced with the whole chunk text so a
+     verifier *could* still judge it, but is never mistaken for a confidently-anchored hit.
 """
 
 from __future__ import annotations
@@ -91,10 +95,6 @@ CHUNK_OBJECTS_MAX = int(os.environ.get("CHUNK_OBJECTS_MAX", "400"))
 CHUNK_TEXT_MAX_CHARS = int(os.environ.get("CHUNK_TEXT_MAX_CHARS", "8000"))
 # prev/next for an anchored object = this many same-type neighbouring objects each side.
 NEIGHBOR_OBJECTS = int(os.environ.get("NEIGHBOR_OBJECTS", "2"))
-# Global per-CI cap on expanded candidates. Direct candidates are always kept in full; this
-# only trims chunk-fanout (which can blow up to tens of thousands of objects for table-heavy
-# chunks) down to the highest-priority objects BEFORE the expensive context/table-fetch work.
-MAX_EXPANDED_CANDIDATES = int(os.environ.get("MAX_EXPANDED_CANDIDATES", "500"))
 # 1 = also attach adjacent-CHUNK text to anchored objects (old behaviour; causes cross-chunk bleed).
 CHUNK_NEIGHBORS_FOR_ANCHORED = os.environ.get("CHUNK_NEIGHBORS_FOR_ANCHORED", "0") == "1"
 
@@ -148,9 +148,11 @@ def handler(event: dict, context: Any) -> dict:
 
 
 def _process(req: dict) -> dict:
-    candidates  = req.get("candidates", [])
+    # Prefer the Evidence Grounder's output; fall back to "candidates" for callers that
+    # already pass pre-grounded, object-level hits only (e.g. standalone tests).
+    candidates  = req.get("grounded_candidates", req.get("candidates", []))
     document_id = req.get("document_id") or ""
-    tenant = req.get("tenant")
+    tenant = req.get("tenant") or {}
     project_id = req.get("project_id")
     tenant_id = tenant.get("tenant_id")
 
@@ -160,10 +162,12 @@ def _process(req: dict) -> dict:
     _reset_container_cache_if_new_document(document_id)
 
     # ── Phase 1: collect all lookup keys ──────────────────────────────────────
+    # Every candidate here already has a matched_object (or is unresolved) — the Grounder
+    # (or the caller, for pre-grounded input) decided that; this stage only builds context.
     primary_ids:  list[str]                          = []
     idx_needed:   set[int]                           = set()
-    ctx_keys:     list[tuple[str, int | None]]       = []
-    _ctx_key_set: set[tuple[str, int | None]]        = set()
+    ctx_keys:     list[tuple[str, int]]              = []
+    _ctx_key_set: set[tuple[str, int]]                = set()
     page_lookups: set[tuple[str, int]]               = set()
     table_ids: set[str]                              = set()
     list_ids: set[str]                                = set()
@@ -185,10 +189,14 @@ def _process(req: dict) -> dict:
         if list_id and obj_meta.get("type") in _LIST_TYPES:
             list_ids.add(str(list_id))
 
-        ctx_key = (cid, obj_meta.get("global_position"))
-        if ctx_key not in _ctx_key_set:
-            ctx_keys.append(ctx_key)
-            _ctx_key_set.add(ctx_key)
+        # Grounded chunk-level candidates bring their own chunk pool (fetched once by the
+        # Grounder, shared across every object grounded from that chunk) — only a candidate
+        # with no pool (a direct retriever hit) needs the ±window position query below.
+        if c.get("_chunk_pool") is None and not obj_meta.get("global_position") is None:
+            ctx_key = (cid, obj_meta.get("global_position"))
+            if ctx_key not in _ctx_key_set:
+                ctx_keys.append(ctx_key)
+                _ctx_key_set.add(ctx_key)
         # Collect page-range neighbor keys for candidates without chunk_idx adjacency
         if obj_meta.get("prev_chunk_idx") is None:
             page_lookups.add(("page_end",   c.get("page_start", 0) - 1))
@@ -201,7 +209,7 @@ def _process(req: dict) -> dict:
     with _TPE(max_workers=CONTEXT_EXPANDER_WORKERS) as _pool:
         _f_chunk = _pool.submit(_mget_chunks, deduped_ids)
         _f_idx   = _pool.submit(_msearch_by_idx, document_id, list(idx_needed), tenant_id=tenant_id, project_id=project_id)
-        _f_ctx   = _pool.submit(_fetch_context_objects_merged, document_id, ctx_keys, tenant_id=tenant_id, project_id=project_id)
+        _f_ctx   = _pool.submit(_fetch_context_window, document_id, ctx_keys, tenant_id=tenant_id, project_id=project_id)
         _f_page  = _pool.submit(_msearch_neighbors_by_page, document_id, list(page_lookups), tenant_id=tenant_id, project_id=project_id)
         _f_table = _pool.submit(_fetch_table_context, document_id, sorted(table_ids), tenant_id=tenant_id, project_id=project_id)
         _f_list  = _pool.submit(_fetch_list_context, document_id, sorted(list_ids), tenant_id=tenant_id, project_id=project_id)
@@ -217,7 +225,7 @@ def _process(req: dict) -> dict:
         chunk_cache.update(_mget_chunks(missed))
 
     # Exact chunk adjacency (chunk_idx ±1) for candidates that need adjacent-chunk text:
-    # chunk-level candidates (no matched object) and, optionally, anchored ones.
+    # unresolved candidates and, optionally, anchored ones.
     extra_idx: set[int] = set()
     for c in candidates:
         if c.get("matched_object") and not CHUNK_NEIGHBORS_FOR_ANCHORED:
@@ -238,82 +246,36 @@ def _process(req: dict) -> dict:
         len(ctx_keys), len(chunk_cache), len(primary_ids),
     )
 
-    # ── Phase 3: resolve every candidate to one or more real semantic objects ──────────
-    # Resolution is separate from context building: a direct hit resolves to its own
-    # matched_object; a chunk-level candidate (matched_object=None) resolves to EVERY real
-    # semantic object indexed under that chunk (fan-out), not a single guessed object. The
-    # only candidate that can leave this phase without a matched_object is one whose chunk
-    # genuinely has zero indexed semantic objects — an indexing gap, not ambiguity to resolve.
-    direct_pending: list[tuple[dict, dict | None, list[dict], str]] = []
-    fanout_scored: list[tuple[tuple, dict, dict, list[dict]]] = []  # (sort_key, candidate, obj, pool)
-    for c in candidates:
-        direct_obj = c.get("matched_object")
-        if direct_obj:
-            pool = ctx_cache.get((c.get("chunk_id", ""), direct_obj.get("global_position")), [])
-            direct_pending.append((c, direct_obj, pool, "direct"))
-            continue
-
-        pool = ctx_cache.get((c.get("chunk_id", ""), None), [])
-        objs = _dedupe_fanout_objects(pool)
-        if not objs:
-            direct_pending.append((c, None, pool, "unresolved"))
-            continue
-        agg_score = c.get("agg_score") or 0.0
-        for o in objs:
-            # Retrieval relevance (originating chunk's own score) is the primary signal;
-            # object type only breaks ties within equally-relevant chunks — otherwise every
-            # heading from a weak chunk would outrank a sentence from a strong one.
-            type_rank = _FANOUT_TYPE_PRIORITY.get(o.get("type"), 7)
-            sort_key = (-agg_score, type_rank, c.get("chunk_id", ""), o.get("global_position") or 0)
-            fanout_scored.append((sort_key, c, o, pool))
-
-    # Global per-CI cap: direct candidates are never trimmed; fan-out objects are ranked by
-    # type priority then by their originating chunk's own retrieval score, and truncated HERE —
-    # before _build_expanded_candidate/table-fetch — so the cap actually saves the work, not
-    # just the output size.
-    fanout_budget = max(MAX_EXPANDED_CANDIDATES - len(direct_pending), 0)
-    if len(fanout_scored) > fanout_budget:
-        fanout_scored.sort(key=lambda t: t[0])
-        logger.info(
-            "[Context Expander] search_id=%s  fanout_cap=%d  fanout_total=%d  dropped=%d",
-            req.get("search_id"), MAX_EXPANDED_CANDIDATES, len(fanout_scored),
-            len(fanout_scored) - fanout_budget,
-        )
-        fanout_scored = fanout_scored[:fanout_budget]
-
-    pending: list[tuple[dict, dict | None, list[dict], str]] = list(direct_pending)
-    extra_table_ids: set[str] = set()
-    extra_list_ids: set[str] = set()
-    for _, c, o, pool in fanout_scored:
-        otype = o.get("type")
-        tid = o.get("table_id")
-        if tid and otype in _TABLE_TYPES and str(tid) not in table_cache:
-            extra_table_ids.add(str(tid))
-        lid = o.get("list_id")
-        if lid and otype in _LIST_TYPES and str(lid) not in list_cache:
-            extra_list_ids.add(str(lid))
-        pending.append((c, o, pool, "fanout"))
-
-    # Fanned-out/direct objects can reference tables/lists Phase 1 never saw (it only scans
-    # the candidate's own matched_object table_id/list_id, which chunk-level candidates don't
-    # have yet) — fetch those now, same document-wide query as the primary path, so every
-    # row/cell/list item gets the complete cross-chunk container instead of just whatever
-    # happens to be in this chunk's objects.
-    if extra_table_ids:
-        table_cache.update(_fetch_table_context(document_id, sorted(extra_table_ids),
-                                                 tenant_id=tenant_id, project_id=project_id))
-    if extra_list_ids:
-        list_cache.update(_fetch_list_context(document_id, sorted(extra_list_ids),
-                                               tenant_id=tenant_id, project_id=project_id))
-
+    # ── Phase 3: build context — exactly one ExpandedCandidate per input candidate ──────
     expanded: list[dict] = []
-    for c, o, pool, origin in pending:
-        if o is None:
-            expanded.append(_build_unresolved_candidate(c, chunk_cache, idx_cache, page_cache))
-        else:
-            expanded.append(_build_expanded_candidate(
-                c, o, pool, table_cache, list_cache, chunk_cache, idx_cache, page_cache, origin,
+    for c in candidates:
+        obj = c.get("matched_object")
+        if obj is None:
+            g = c.get("grounding") or {}
+            expanded.append(_build_unresolved_candidate(
+                c, chunk_cache, idx_cache, page_cache, g.get("reason") or "no_reliable_anchor", g,
             ))
+            continue
+        pool = c.get("_chunk_pool")
+        if pool is not None:
+            context_objects = _context_window(pool, obj, CONTEXT_WINDOW)
+            origin = "grounded"
+        else:
+            context_objects = ctx_cache.get((c.get("chunk_id", ""), obj.get("global_position")), [])
+            origin = "direct"
+        expanded.append(_build_expanded_candidate(
+            c, obj, context_objects, table_cache, list_cache, chunk_cache, idx_cache, page_cache,
+            origin, c.get("grounding") or {"method": "direct_object", "confidence": 1.0},
+        ))
+
+    if len(expanded) != len(candidates):
+        raise RuntimeError(
+            f"context expansion changed candidate count: in={len(candidates)} out={len(expanded)}"
+        )
+
+    grounding_stats = dict(req.get("grounding_stats") or {})
+    grounding_stats["contextualized_candidates"] = len(expanded)
+    logger.info("[Context Expander] search_id=%s  grounding=%s", req.get("search_id"), grounding_stats)
 
     if expanded:
         avg_chars = sum(e.get("current_text_chars", 0) for e in expanded) / len(expanded)
@@ -323,7 +285,7 @@ def _process(req: dict) -> dict:
             max(e.get("current_text_chars", 0) for e in expanded),
         )
 
-    return {**req, "expanded_candidates": expanded}
+    return {**req, "expanded_candidates": expanded, "grounding_stats": grounding_stats}
 
 
 # ── Heading normalizer ────────────────────────────────────────────────────────
@@ -388,20 +350,19 @@ def _sort_context_objects(
 
 _TABLE_TYPES = {"table_header", "table_row", "table_cell"}
 _LIST_TYPES  = {"list_item", "list"}
+_VECTOR_FIELDS = {"dense_vector", "heading_dense_vector"}
 
-# Fan-out prioritization when over MAX_EXPANDED_CANDIDATES: prose-like objects first (most
-# likely to carry unique evidence), table_cell last (its text is mostly already covered by
-# its own table_row — see _format_table_context's row-preferred rendering).
-_FANOUT_TYPE_PRIORITY = {
-    "heading":      0,
-    "sentence":     1,
-    "paragraph":    2,
-    "table_row":    3,
-    "table_header": 4,
-    "list_item":    5,
-    "table_cell":   6,
-}
 
+def _context_window(pool: list[dict], obj: dict, n: int) -> list[dict]:
+    """Slice a Grounder-supplied chunk pool to ±n positions around obj, stripping
+    embedding vectors (payload size) — used for grounded chunk-level candidates, which
+    already have their chunk's full pool in memory and need no extra OpenSearch round-trip."""
+    pos = obj.get("global_position")
+    near = pool if not isinstance(pos, int) else [
+        o for o in pool
+        if isinstance(o.get("global_position"), int) and abs(o["global_position"] - pos) <= n
+    ]
+    return [{k: v for k, v in o.items() if k not in _VECTOR_FIELDS} for o in near]
 
 
 def _local_neighbors(
@@ -434,13 +395,6 @@ def _local_neighbors(
         return " ".join(" ".join(str(o["text"]).split()) for o in objs)
 
     return _join(before), _join(after)
-
-
-def _dedupe_fanout_objects(pool: list[dict]) -> list[dict]:
-    """Every real semantic object with text becomes its own candidate — correctness over
-    candidate-count for now; paragraph/sentence overlap can be optimized later once fan-out
-    volume and verifier duplicate-hit behavior are measured."""
-    return [o for o in pool if (o.get("text") or "").strip()]
 
 
 def _object_heading(obj: dict) -> str:
@@ -616,7 +570,8 @@ def _build_expanded_candidate(
     chunk_cache:     dict[str, dict],
     idx_cache:       dict[int, str],
     page_cache:      dict[tuple, str],
-    origin:          str,   # "direct" | "fanout"
+    origin:          str,       # "direct" | "grounded"
+    grounding:       dict,      # from the Evidence Grounder: {method, confidence, evidence_matches}
 ) -> dict:
     built = _expand_object_context(obj, context_objects, table_cache, list_cache)
 
@@ -632,9 +587,12 @@ def _build_expanded_candidate(
 
     retrieval_origin = (
         f"direct_{obj.get('type') or 'unknown'}" if origin == "direct"
-        else f"via_chunk_fanout_{obj.get('type') or 'unknown'}"
+        else f"via_chunk_{obj.get('type') or 'unknown'}"
     )
-    selection_reason = "retriever_direct" if origin == "direct" else "chunk_fanout"
+    selection_reason = (
+        "retriever_direct" if origin == "direct"
+        else f"grounded_{grounding.get('method', 'unknown')}"
+    )
 
     # The candidate's page_start/page_end/match_page start out as the CONTAINING CHUNK's
     # page range (set by the retriever, e.g. literal_retriever's hit.page_start/page_end).
@@ -657,6 +615,8 @@ def _build_expanded_candidate(
         "resolution_reason":  None,
         "anchored":           True,
         "unanchored_reason":  None,
+        "grounding":          grounding,
+        "literal_match_count": len(grounding.get("evidence_matches") or []),
         "context_strategy":   built["context_strategy"],
         "context_complete":   built["context_complete"],
         "context_warning":    built["context_warning"],
@@ -693,13 +653,19 @@ def _build_unresolved_candidate(
     chunk_cache: dict[str, dict],
     idx_cache:   dict[int, str],
     page_cache:  dict[tuple, str],
+    reason:      str,
+    grounding:   dict,
 ) -> dict:
-    """Last resort only: the chunk has genuinely zero indexed semantic objects (an
-    indexing gap, not ambiguity). Never fabricate a matched_object — surface the whole
-    chunk text so a verifier *could* still judge it, but mark it unresolved so it is never
-    mistaken for a normal, confidently-anchored hit."""
-    chunk_id   = candidate.get("chunk_id", "")
-    chunk_text = chunk_cache.get(chunk_id, {}).get("raw_text", "")
+    """Last resort only: the Evidence Grounder couldn't anchor this candidate to a real
+    semantic object (empty chunk pool, or no reliable span/local-score match). Never
+    fabricate a matched_object — surface the whole chunk text so a verifier *could* still
+    judge it, but mark it unresolved so it is never mistaken for a confidently-anchored hit.
+    No matched_object means no geometry (document-chunks never stores one — only
+    semantic-objects do) — S5's confidence gate hard-filters every unresolved candidate
+    before the LLM/merger, so this never reaches final_hits regardless."""
+    chunk_id       = candidate.get("chunk_id", "")
+    chunk_doc      = chunk_cache.get(chunk_id, {})
+    chunk_text     = chunk_doc.get("raw_text", "")
     if len(chunk_text) > CHUNK_TEXT_MAX_CHARS:
         chunk_text = chunk_text[:CHUNK_TEXT_MAX_CHARS]
     prev_text, next_text = _chunk_adjacent_text(candidate, None, chunk_cache, idx_cache, page_cache)
@@ -707,15 +673,19 @@ def _build_unresolved_candidate(
     return {
         **candidate,
         "matched_object":     None,
+        "geometry":           {},
+        "highlight_mode":     "none",
         "retrieval_origin":   "via_chunk_unresolved",
-        "selection_reason":   "unresolved_no_objects",
+        "selection_reason":   f"unresolved_{reason}",
         "resolution_status":  "unresolved",
-        "resolution_reason":  "no_semantic_objects_for_chunk",
+        "resolution_reason":  reason,
         "anchored":           False,
-        "unanchored_reason":  "no_semantic_objects_for_chunk",
+        "unanchored_reason":  reason,
+        "grounding":          grounding,
+        "literal_match_count": 0,
         "context_strategy":   "chunk_fallback",
         "context_complete":   False,
-        "context_warning":    "no_semantic_objects_for_chunk",
+        "context_warning":    reason,
         "matched_distance":   None,
         "distance_ratio":     None,
         "current_text_chars": len(chunk_text),
@@ -1162,13 +1132,15 @@ def _paginate_container_objects(
     return initial
 
 
-def _fetch_context_objects_merged(
+def _fetch_context_window(
     document_id: str,
-    ctx_keys:    list[tuple[str, int | None]],
+    ctx_keys:    list[tuple[str, int]],
     tenant_id: str | None = None,
     project_id: str | None = None,
 ) -> dict[tuple, list[dict]]:
-    """Fetch context objects for all candidates in ONE OpenSearch terms query.
+    """Fetch ±CONTEXT_WINDOW neighbourhoods for direct (object-level) retriever hits in ONE
+    OpenSearch terms query. Chunk-level candidates don't use this — the Evidence Grounder
+    already fetched their full chunk pool, carried on the candidate as "_chunk_pool".
 
     Instead of N range sub-queries, expand every center_pos by ±CONTEXT_WINDOW,
     deduplicate all resulting positions, then issue a single terms(global_position)
@@ -1179,53 +1151,16 @@ def _fetch_context_objects_merged(
         return {}
 
     result: dict[tuple, list[dict]] = {}
-    with_pos    = [(key, key[1]) for key in ctx_keys if key[1] is not None]
-    without_pos = [key for key in ctx_keys if key[1] is None]
-
-    # ── Chunk-only fallbacks (no global_position) — still need per-chunk queries ──
-    if without_pos:
-        body: list[dict] = []
-        for key in without_pos:
-            body.append({})
-            body.append({
-                "size": CHUNK_OBJECTS_MAX,
-                "query": {"bool": {"filter": [
-                    {"term": {"parent_chunk_id": key[0]}},
-                    *([{"term": {"document_id": document_id}}] if document_id else []),
-                    *([{"term": {"tenant_id": tenant_id}}] if tenant_id else []),
-                    *([{"term": {"project_id": project_id}}] if project_id else []),
-                ]}},
-                "sort": [{"global_position": "asc"}],
-            })
-        try:
-            resp = _get_os().msearch(body=body, index=SEMANTIC_OBJECTS_INDEX)
-            for i, r in enumerate(resp.get("responses", [])):
-                result[without_pos[i]] = [h["_source"] for h in r.get("hits", {}).get("hits", [])]
-        except Exception as exc:
-            logger.warning("[Context Expander] chunk-only msearch failed: %s", exc)
-            for key in without_pos:
-                result[key] = []
-
-        # CHUNK_OBJECTS_MAX is a page size, not a hard cap — page through with search_after-
-        # style range queries so a chunk with more objects than the limit isn't silently
-        # truncated (fan-out's "every real object becomes a candidate" invariant depends on this).
-        by_chunk_id = {key[0]: result.get(key, []) for key in without_pos}
-        by_chunk_id = _paginate_container_objects(by_chunk_id, document_id, "parent_chunk_id", CHUNK_OBJECTS_MAX, tenant_id, project_id)
-        for key in without_pos:
-            result[key] = by_chunk_id[key[0]]
-
-    if not with_pos:
-        return result
 
     # ── Expand all center positions to full ±CONTEXT_WINDOW neighbourhoods ────
     needed: set[int] = set()
-    for _, center_pos in with_pos:
+    for _, center_pos in ctx_keys:
         for offset in range(-CONTEXT_WINDOW, CONTEXT_WINDOW + 1):
             needed.add(center_pos + offset)
 
     logger.info(
         "[Context Expander] ctx_keys=%d  needed_positions=%d  os_queries=1",
-        len(with_pos), len(needed),
+        len(ctx_keys), len(needed),
     )
 
     # ── ONE terms query — all needed positions in a single request ────────────
@@ -1262,7 +1197,7 @@ def _fetch_context_objects_merged(
         logger.warning("[Context Expander] terms context fetch failed: %s", exc)
 
     # ── Resolve per-key neighborhood from the local position dict ─────────────
-    for key, center_pos in with_pos:
+    for key, center_pos in ctx_keys:
         neighborhood = []
         for offset in range(-CONTEXT_WINDOW, CONTEXT_WINDOW + 1):
             neighborhood.extend(pos_to_objs.get(center_pos + offset, []))

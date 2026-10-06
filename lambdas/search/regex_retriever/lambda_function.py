@@ -126,7 +126,10 @@ def _regex_search(
                     first_snippet = raw_text[start:end]
                 if m.start() not in seen_starts:
                     seen_starts.add(m.start())
-                    regex_matches.append({"text": m.group(0), "start": m.start(), "end": m.end(), "source": "regex"})
+                    regex_matches.append({
+                        "match_id": f"regex_{m.start()}_{m.end()}",
+                        "text": m.group(0), "start": m.start(), "end": m.end(), "source": "regex",
+                    })
 
         if match_count > 0:
             regex_matches.sort(key=lambda rm: rm["start"])

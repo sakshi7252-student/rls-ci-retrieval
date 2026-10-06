@@ -401,6 +401,17 @@ def _s3_aggregate(req: dict) -> dict:
     return req
 
 
+def _s3_5_ground_evidence(req: dict) -> dict:
+    if req.get("_failed") or req.get("_early_exit"):
+        return req
+    t0  = time.perf_counter()
+    mod = _load("search/evidence_grounder", "search_evidence_grounder")
+    _inject_os(mod)
+    req = mod._process(req)
+    req["_st"]["evidence_grounder"] = round(time.perf_counter() - t0, 3)
+    return req
+
+
 def _s4_context_expand(req: dict) -> dict:
     if req.get("_failed") or req.get("_early_exit"):
         return req
@@ -473,9 +484,16 @@ def _s5_rerank(req: dict, skip_rerank: bool = False) -> dict:
     req["_st"]["reranker"] = round(time.perf_counter() - t0, 3)
 
     # 5.6 Confidence gate
+    # Hard invariant: no semantic object -> no LLM call, no final_hit. An unresolved
+    # candidate (Evidence Grounder couldn't anchor it to a real semantic object) has no
+    # matched_object and therefore no geometry to highlight in the UI — sending its raw
+    # chunk text to the LLM only risks producing a YES/MAYBE verdict with nothing
+    # displayable behind it. Gate it out here, before it ever reaches S6.
     passed, gated = [], []
     for c in req.get("ranked_candidates", []):
-        if _candidate_confidence(c) >= _CONF_THRESHOLD:
+        if not c.get("matched_object"):
+            gated.append({**c, "verdict": "NO", "reason": "unresolved_no_semantic_object"})
+        elif _candidate_confidence(c) >= _CONF_THRESHOLD:
             passed.append(c)
         else:
             gated.append({**c, "verdict": "NO", "reason": "candidate_confidence_gate"})
@@ -665,6 +683,7 @@ def _run_pipeline(all_reqs: list[dict], skip_rerank: bool, skip_verify: bool,
         ("S1:classify",          lambda r: _s1_classify(r),                         n_workers),
         ("S2:retrieve",          lambda r: _s2_retrieve(r),                         n_workers),
         ("S3:aggregate",         lambda r: _s3_aggregate(r),                        n_workers),
+        ("S3.5:ground_evidence", lambda r: _s3_5_ground_evidence(r),                n_workers),
         ("S4:context_expand",    lambda r: _s4_context_expand(r),                   n_workers),
         ("S5:rerank",            lambda r: _s5_rerank(r, skip_rerank),         1),
         ("S6:llm_verify",        lambda r: _s6_llm_verify(r, skip_verify),     n_workers),
@@ -811,6 +830,7 @@ def _save_results_debug_s3(all_results: list[dict], event, wall_time: float = 0.
             for rk in retriever_keys
         },
         "aggregator":              _agg_t("aggregator"),
+        "evidence_grounder":       _agg_t("evidence_grounder"),
         "context_expander":        _agg_t("context_expander"),
         "reranker":                _agg_t("reranker"),
         "llm_verifier":            _agg_t("llm_verifier"),

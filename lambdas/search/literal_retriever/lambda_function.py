@@ -234,14 +234,14 @@ def _extract_literal_matches(ci_text: str, raw_text: str) -> list[dict]:
     idx  = raw_lower.find(ci_lower)
     if idx >= 0:
         start, end = _map_span(raw_index_map, idx, len(ci_lower))
-        return [{"text": raw_text[start:end], "start": start, "end": end}]
+        return [{"text": raw_text[start:end], "start": start, "end": end, "match_id": f"literal_{start}_{end}"}]
 
     # Strategy 1b — whole phrase, exact match but ignoring whitespace
     # differences ("n=62" vs "n = 62") and wrapping punctuation.
     span_ws = _find_ignoring_whitespace(ci_lower, raw_lower, raw_index_map)
     if span_ws is not None:
         start, end = span_ws
-        return [{"text": raw_text[start:end], "start": start, "end": end}]
+        return [{"text": raw_text[start:end], "start": start, "end": end, "match_id": f"literal_{start}_{end}"}]
 
     # Strategy 2 — whole phrase, longest common substring. Absorbs any kind of
     # decoration mismatch (markers, quotes, labels, punctuation, initials...)
@@ -251,7 +251,7 @@ def _extract_literal_matches(ci_text: str, raw_text: str) -> list[dict]:
     min_len = max(_MIN_PARTIAL_CHARS, int(len(ci_lower) * _MIN_PARTIAL_RATIO))
     if span.size >= min_len:
         start, end = _map_span(raw_index_map, span.b, span.size)
-        matches.append({"text": raw_text[start:end], "start": start, "end": end})
+        matches.append({"text": raw_text[start:end], "start": start, "end": end, "match_id": f"literal_{start}_{end}"})
 
     # Strategy 3 — significant sub-phrases, exact then fuzzy. Only meaningful
     # when ci_text actually splits into more than one clause — a single-clause
@@ -263,18 +263,18 @@ def _extract_literal_matches(ci_text: str, raw_text: str) -> list[dict]:
             idx = raw_lower.find(phrase_lower)
             if idx >= 0:
                 start, end = _map_span(raw_index_map, idx, len(phrase_lower))
-                matches.append({"text": raw_text[start:end], "start": start, "end": end})
+                matches.append({"text": raw_text[start:end], "start": start, "end": end, "match_id": f"literal_{start}_{end}"})
                 continue
             span_ws = _find_ignoring_whitespace(phrase_lower, raw_lower, raw_index_map)
             if span_ws is not None:
                 start, end = span_ws
-                matches.append({"text": raw_text[start:end], "start": start, "end": end})
+                matches.append({"text": raw_text[start:end], "start": start, "end": end, "match_id": f"literal_{start}_{end}"})
                 continue
             span = _longest_common_span(phrase_lower, raw_lower)
             min_len = max(_MIN_PARTIAL_CHARS, int(len(phrase_lower) * _MIN_PARTIAL_RATIO))
             if span.size >= min_len:
                 start, end = _map_span(raw_index_map, span.b, span.size)
-                matches.append({"text": raw_text[start:end], "start": start, "end": end})
+                matches.append({"text": raw_text[start:end], "start": start, "end": end, "match_id": f"literal_{start}_{end}"})
 
     # Deduplicate overlapping spans, keep leftmost
     seen: set[int] = set()
