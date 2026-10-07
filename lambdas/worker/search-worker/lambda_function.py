@@ -1114,6 +1114,12 @@ def _hit_with_provenance(hit: dict, debug: bool = False) -> dict:
         "llm_verified":          hit.get("llm_verified"),
         "disagreement_route":    hit.get("disagreement_route"),
         "verdict_override_reason": hit.get("verdict_override_reason"),
+
+        #temporary UI data override for no change in the UI display
+        "evidence_type":          hit.get("evidence_type") or "RELATED",
+        "evidence_reason":         hit.get("evidence_reason") or hit.get("reason") or "",
+        "evidence_confidence":     hit.get("evidence_confidence") if hit.get("evidence_confidence") is not None else hit.get("confidence"),
+        
         # Full detail in debug mode (S3 debug.json); trimmed for the orchestrator's
         # inline response since the UI only reads geometry/ids (see createHighlight.ts).
         "indexed_object":        _indexed_object(hit) if debug else _indexed_object_minimal(hit),
