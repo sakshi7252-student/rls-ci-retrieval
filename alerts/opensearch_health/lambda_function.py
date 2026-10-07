@@ -473,4 +473,8 @@ def lambda_handler(event, context):
         }
     except Exception as e:
         logger.error(f"{RESOURCE} scan failed: {str(e)}")
+        try:
+            send_sns_alert([{"schema": DOMAIN_NAME or RESOURCE, "error": str(e), "severity": "P0"}], "WATCHDOG_EXECUTION_FAILED", RESOURCE)
+        except Exception as sns_exc:
+            logger.error(f"Failed to send WATCHDOG_EXECUTION_FAILED alert: {str(sns_exc)}")
         return {"statusCode": 500, "resource": RESOURCE, "error": str(e)}
