@@ -82,6 +82,7 @@ def _classify_evidence(ci_text: str, hit: dict, doc_ctx: dict) -> dict:
         # Normalise any plain RELATED to RELATED_EFFICACY as safe default
         if ev == "RELATED":
             ev = "RELATED_EFFICACY"
+        logger.info("[Evidence Classifier] single in_tok=%d out_tok=%d", ec_in_tok, ec_out_tok)
         return {
             "evidence_type":       ev,
             "evidence_confidence": float(parsed.get("confidence", 0.5)),
@@ -152,6 +153,7 @@ def _classify_evidence_batch(ci_text: str, hits: list[dict], doc_ctx: dict) -> l
             raise ValueError(f"Expected {len(hits)} items, got {len(parsed)}")
         # If Claude still returned fewer items, classify the missed ones individually
         # (don't pad with a placeholder — a dropped DIRECT hit would be misclassified)
+        n_missing = max(0, len(hits) - len(parsed))
         if len(parsed) < len(hits):
             logger.warning("[EC] batch returned %d/%d — classifying %d missed hits individually",
                            len(parsed), len(hits), len(hits) - len(parsed))
@@ -177,6 +179,8 @@ def _classify_evidence_batch(ci_text: str, hits: list[dict], doc_ctx: dict) -> l
                 "evidence_reason":     item.get("reason", ""),
                 "_ec_tokens":          {"input": per[0], "output": per[1]},
             })
+        logger.info("[Evidence Classifier] batch n=%d in_tok=%d out_tok=%d missing=%d",
+                    len(hits), in_tok, out_tok, n_missing)
         return results
     except Exception as exc:
         logger.warning("[EC] batch failed (%s) \u2014 falling back to sequential", exc)
