@@ -468,19 +468,42 @@ def _dedupe_by_object_id(candidates: list[dict]) -> list[dict]:
     return merged
 
 
+def _run_comparators_only(req: dict) -> None:
+    """Populate score_breakdown.contra_detail without loading the CE model.
+
+    _detect_semantic_conflicts/_score_semantic_conflicts are pure Python
+    (drug/endpoint/statistical/etc. comparators) — no sentence-transformers
+    import happens unless _get_ce_model() is called, which we never do here.
+    """
+    reranker = _load("search/reranker", "search_reranker")
+    ci = req.get("ci") or {}
+    ci_entities = ci.get("ner", {}).get("entities", [])
+    ci_ctx = reranker._build_ci_context(ci, ci_entities)
+    for c in req.get("ranked_candidates", []):
+        if not c.get("matched_object"):
+            continue
+        cand_ctx = reranker._build_cand_context(c)
+        vr = reranker._detect_semantic_conflicts(ci_ctx, cand_ctx)
+        _, contra_detail = reranker._score_semantic_conflicts(vr)
+        c["score_breakdown"] = {**c.get("score_breakdown", {}), "contra_detail": contra_detail}
+
+
 def _s5_rerank(req: dict, skip_rerank: bool = False) -> dict:
-    """Reranking stage — currently always skips reranker for cold start reduction."""
+    """Reranking stage — the CE model is always skipped for cold start reduction,
+    but the deterministic comparator pipeline (drug/endpoint/statistical/etc.
+    conflict detection) still runs since it costs no model load, just Python."""
     if req.get("_failed") or req.get("_early_exit"):
         return req
     t0 = time.perf_counter()
-    # Skip reranker entirely (skip_rerank always True) — set uniform score
+    # Skip CE model entirely — set uniform score above MIN_RERANK_SCORE (3.0)
+    # so all candidates reach Claude regardless of comparator findings below.
     expanded = req.get("expanded_candidates", [])
     req["ranked_candidates"] = [
-        # Set score above MIN_RERANK_SCORE (3.0) so all candidates reach Claude
         {**c, "cross_encoder_score": 10.0}
         for c in expanded
     ]
     req["ranked_candidates"] = _dedupe_by_object_id(req["ranked_candidates"])
+    _run_comparators_only(req)
     req["_st"]["reranker"] = round(time.perf_counter() - t0, 3)
 
     # 5.6 Confidence gate
@@ -555,7 +578,39 @@ def _s6_llm_verify(req: dict, skip_verify: bool = False) -> dict:
     # reach the verifier above, but without this they vanish from the debug json entirely —
     # rejoin them here so _clean_result's rejected_hits picks them up.
     req["verified_candidates"].extend(req.pop("skipped_hits", []))
+    _downgrade_statistical_conflicts(req.get("verified_candidates", []))
     return req
+
+
+# HIGH/MEDIUM-severity structural conflicts (e.g. statistical.py's percentage/
+# p_value/sample_size comparator) are objective, code-computed ground truth —
+# the LLM free-reasons from text and can render YES even when it has itself
+# narrated the mismatch (confirmed in production: CI220, 95%-vs-90% power,
+# verdict=YES/confidence=0.92 with verifier_reason explicitly stating "power
+# differs"). Downgrade rather than hard-veto to NO: a wrong comparator slot
+# match (extraction mis-mapping two different facts) should surface the hit
+# for review, not silently delete a true positive.
+_STRUCTURAL_VETO_SEVERITIES = ("HIGH", "MEDIUM")
+
+
+def _downgrade_statistical_conflicts(candidates: list) -> None:
+    for c in candidates:
+        if c.get("verdict") != "YES":
+            continue
+        contra_detail = (c.get("score_breakdown") or {}).get("contra_detail")
+        if not isinstance(contra_detail, dict):
+            continue   # [] when no conflicts were found — nothing to check
+        conflict = contra_detail.get("statistical")
+        if not conflict or conflict.get("severity") not in _STRUCTURAL_VETO_SEVERITIES:
+            continue
+        c["verdict"] = "MAYBE"
+        c["structural_conflict"] = conflict
+        c["reason"] = (
+            f"{c.get('reason', '')} "
+            f"[downgraded: structured comparator found statistical conflict "
+            f"{conflict.get('evidence', {}).get('conflict')}]"
+        ).strip()
+    return
 
 
 def _s7_highlight_extract(req: dict) -> dict:
