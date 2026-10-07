@@ -30,6 +30,7 @@ import logging
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -466,8 +467,10 @@ def _verify_individually(ci_text: str, header: str, cands: list[dict]) -> list[d
     """Per-candidate calls in parallel (order preserved). Used for fallbacks."""
     if len(cands) == 1 or _MAX_WORKERS <= 1:
         return [_verify_one(ci_text, header, c) for c in cands]
+    ctx = copy_context()  # propagate caller's [tenant=/document=/search=] ContextVars
     with ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(cands))) as pool:
-        return list(pool.map(lambda c: _verify_one(ci_text, header, c), cands))
+        futures = [pool.submit(ctx.run, _verify_one, ci_text, header, c) for c in cands]
+        return [f.result() for f in futures]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -505,8 +508,12 @@ def _verify_batch(
             return out
         # Independent Bedrock calls, one per chunk — run them concurrently instead of
         # waiting on each one before starting the next. Order preserved via pool.map.
+        # copy_context() carries the caller's [tenant=/document=/search=] ContextVars into
+        # these worker threads — plain pool.map would leave them on default "-".
+        ctx = copy_context()
         with ThreadPoolExecutor(max_workers=min(_MAX_WORKERS, len(chunks))) as pool:
-            chunk_results = list(pool.map(lambda c: _verify_chunk(ci_text, header, c), chunks))
+            futures = [pool.submit(ctx.run, _verify_chunk, ci_text, header, c) for c in chunks]
+            chunk_results = [f.result() for f in futures]
         out = []
         for r in chunk_results:
             out.extend(r)

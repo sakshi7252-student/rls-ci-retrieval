@@ -763,11 +763,15 @@ def _run_pipeline(all_reqs: list[dict], skip_rerank: bool, skip_verify: bool,
             stage_wall[stage_key] = 0.0
             continue
         t_stage = time.perf_counter()
+        # copy_context() propagates the [tenant=/document=/search=] ContextVars (set on the
+        # main thread in _handle_invocation) into these pool worker threads — plain pool.map
+        # leaves them on default "-" since new threads don't inherit the caller's context.
         with ThreadPoolExecutor(max_workers=stage_workers) as pool:
-            all_reqs = list(pool.map(
-                lambda r: _safe_stage_wrapper(stage_key, stage_fn, r),
-                all_reqs
-            ))
+            futures = [
+                pool.submit(copy_context().run, _safe_stage_wrapper, stage_key, stage_fn, r)
+                for r in all_reqs
+            ]
+            all_reqs = [f.result() for f in futures]
         stage_wall[stage_key] = round(time.perf_counter() - t_stage, 3)
         logger.info(
             "[SearchFlow] STAGE_WALL stage=%s wall_s=%.3f active=%d "
