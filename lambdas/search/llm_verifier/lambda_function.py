@@ -392,17 +392,9 @@ def _build_result(cand: dict, item: dict, in_tok: int, out_tok: int) -> dict:
     match_type = str(item.get("match_type", "")).upper().strip()
     verdict    = str(item.get("verdict", "")).upper().strip()
 
-    # match_type is the primary judgement; verdict is derived so they can never disagree.
-    if match_type in _MATCH_TO_VERDICT:
-        derived = _MATCH_TO_VERDICT[match_type]
-        if verdict and verdict != derived:
-            logger.info("[LLM Verifier] verdict %s overridden by match_type %s chunk=%s",
-                        verdict, match_type, cand.get("chunk_id"))
-        verdict = derived
-    else:
-        match_type = None
-        if verdict not in ("YES", "NO", "MAYBE"):
-            verdict = "MAYBE"
+
+    if verdict not in ("YES", "NO", "MAYBE"):
+        verdict = "MAYBE"
 
     raw_id = item.get("identity") if isinstance(item.get("identity"), dict) else {}
     identity = {d: (raw_id.get(d) if isinstance(raw_id.get(d), bool) else None) for d in _DIMS}

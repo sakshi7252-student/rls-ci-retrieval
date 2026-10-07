@@ -527,11 +527,11 @@ def _s5_rerank(req: dict, skip_rerank: bool = False) -> dict:
     passed, gated = [], []
     for c in req.get("ranked_candidates", []):
         if not c.get("matched_object"):
-            gated.append({**c, "verdict": "NO", "reason": "unresolved_no_semantic_object", "llm_verified": False})
+            gated.append({**c, "verdict": "SKIP", "reason": "unresolved_no_semantic_object", "llm_verified": False})
         elif _candidate_confidence(c) >= _CONF_THRESHOLD:
             passed.append(c)
         else:
-            gated.append({**c, "verdict": "NO", "reason": "candidate_confidence_gate", "llm_verified": False})
+            gated.append({**c, "verdict": "SKIP", "reason": "candidate_confidence_gate", "llm_verified": False})
     req["ranked_candidates"] = passed
     req.setdefault("skipped_hits", []).extend(gated)
     return req
@@ -552,7 +552,7 @@ def _s6_llm_verify(req: dict, skip_verify: bool = False) -> dict:
         req["verified_candidates"] = [
             # llm_verified=False: no real verdict was produced, so the disagreement
             # router below must not treat this as an LLM judgement to agree/disagree with.
-            {**c, "verdict": "MAYBE", "reason": "skipped", "confidence": 0.5, "llm_verified": False}
+            {**c, "verdict": "SKIP", "reason": "skipped", "confidence": 0.5, "llm_verified": False}
             for c in req.get("ranked_candidates", [])
         ]
         req["_st"]["per_verifier_call_s"]    = {}
@@ -719,7 +719,7 @@ def _s9_evidence_classify(req: dict, skip_verify: bool = False) -> dict:
                 ec_clean = _calibrate_evidence(hit, ec_clean)
                 hit.update(ec_clean)
                 if _is_related(ec_clean["evidence_type"]):
-                    hit["verdict"] = "RELATED"
+                    hit["verdict"] = "MAYBE"
                 elif ec_clean["evidence_type"] == "UNRELATED":
                     # Deliberately allowed to override a disagreement-router MAYBE
                     # (see _apply_disagreement_router): this is a third, independent

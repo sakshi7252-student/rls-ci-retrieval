@@ -98,7 +98,7 @@ def _process(req: dict) -> dict:
     # final_hits is the one place the UI reads geometry from to highlight evidence.
     accepted = [
         c for c in verified
-        if c.get("verdict") in ("YES", "MAYBE") and c.get("matched_object")
+        if c.get("verdict") in ("YES", "MAYBE", "NO") and c.get("matched_object")
     ]
     final_hits = _build_individual_hits(ci_id, ci_text, accepted)
     return {**req, "final_hits": final_hits}
