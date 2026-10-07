@@ -205,14 +205,18 @@ def _process(req: dict) -> dict:
 
     # ── Phase 2: run all 5 fetches concurrently (they're independent) ──────────
     from concurrent.futures import ThreadPoolExecutor as _TPE
+    from contextvars import copy_context as _copy_context
     deduped_ids = list(dict.fromkeys(primary_ids))
+    # copy_context() per submit (fresh copy each time, never reused across threads) propagates
+    # the caller's [tenant=/document=/search=] ContextVars — a single reused Context can't be
+    # entered by more than one thread at once and raises "cannot enter context".
     with _TPE(max_workers=CONTEXT_EXPANDER_WORKERS) as _pool:
-        _f_chunk = _pool.submit(_mget_chunks, deduped_ids)
-        _f_idx   = _pool.submit(_msearch_by_idx, document_id, list(idx_needed), tenant_id=tenant_id, project_id=project_id)
-        _f_ctx   = _pool.submit(_fetch_context_window, document_id, ctx_keys, tenant_id=tenant_id, project_id=project_id)
-        _f_page  = _pool.submit(_msearch_neighbors_by_page, document_id, list(page_lookups), tenant_id=tenant_id, project_id=project_id)
-        _f_table = _pool.submit(_fetch_table_context, document_id, sorted(table_ids), tenant_id=tenant_id, project_id=project_id)
-        _f_list  = _pool.submit(_fetch_list_context, document_id, sorted(list_ids), tenant_id=tenant_id, project_id=project_id)
+        _f_chunk = _pool.submit(_copy_context().run, _mget_chunks, deduped_ids)
+        _f_idx   = _pool.submit(_copy_context().run, _msearch_by_idx, document_id, list(idx_needed), tenant_id=tenant_id, project_id=project_id)
+        _f_ctx   = _pool.submit(_copy_context().run, _fetch_context_window, document_id, ctx_keys, tenant_id=tenant_id, project_id=project_id)
+        _f_page  = _pool.submit(_copy_context().run, _msearch_neighbors_by_page, document_id, list(page_lookups), tenant_id=tenant_id, project_id=project_id)
+        _f_table = _pool.submit(_copy_context().run, _fetch_table_context, document_id, sorted(table_ids), tenant_id=tenant_id, project_id=project_id)
+        _f_list  = _pool.submit(_copy_context().run, _fetch_list_context, document_id, sorted(list_ids), tenant_id=tenant_id, project_id=project_id)
         chunk_cache: dict[str, dict]         = _f_chunk.result()
         idx_cache:   dict[int, str]          = _f_idx.result()
         ctx_cache:   dict[tuple, list[dict]] = _f_ctx.result()

@@ -124,14 +124,18 @@ def _process(req: dict) -> dict:
 
     # Lanes 1-3 are independent — run concurrently to eliminate serial latency
     from concurrent.futures import ThreadPoolExecutor as _TPE
+    from contextvars import copy_context as _copy_context
     import time as _time
+    # copy_context() per submit (fresh copy each time) propagates the caller's
+    # [tenant=/document=/search=] ContextVars — a single reused Context can't be entered
+    # by more than one thread at once and raises "cannot enter context".
     with _TPE(max_workers=VECTOR_SEARCH_WORKERS) as _pool:
         _ts_obj  = _time.perf_counter()
-        _f_obj   = _pool.submit(_vector_search_objects,         ci_embedding, document_id, tenant_id=tenant_id, project_id=project_id, k=k)
+        _f_obj   = _pool.submit(_copy_context().run, _vector_search_objects,         ci_embedding, document_id, tenant_id=tenant_id, project_id=project_id, k=k)
         _ts_head = _time.perf_counter()
-        _f_head  = _pool.submit(_vector_search_objects_heading, ci_embedding, document_id, tenant_id=tenant_id, project_id=project_id, k=k)
+        _f_head  = _pool.submit(_copy_context().run, _vector_search_objects_heading, ci_embedding, document_id, tenant_id=tenant_id, project_id=project_id, k=k)
         _ts_chunk = _time.perf_counter()
-        _f_chunk = _pool.submit(_vector_search_chunks,          ci_embedding, document_id, tenant_id=tenant_id, project_id=project_id, k=k)
+        _f_chunk = _pool.submit(_copy_context().run, _vector_search_chunks,          ci_embedding, document_id, tenant_id=tenant_id, project_id=project_id, k=k)
         obj_hits   = _f_obj.result();   _te_obj   = _time.perf_counter()
         head_hits  = _f_head.result();  _te_head  = _time.perf_counter()
         chunk_hits = _f_chunk.result(); _te_chunk = _time.perf_counter()

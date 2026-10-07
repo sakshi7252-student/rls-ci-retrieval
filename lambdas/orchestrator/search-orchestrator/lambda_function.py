@@ -66,7 +66,7 @@ import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from pathlib import Path
 from typing import Any
 
@@ -297,8 +297,12 @@ def _load_cis_parallel(
     raw_cis: list[dict], tenant: dict, n_workers: int
 ) -> list[dict]:
     """Bulk-fetch enriched CIs from ci-objects in parallel."""
+    # copy_context() per submit (fresh copy each time) propagates the caller's
+    # [tenant=/document=/search=] ContextVars — a single reused Context can't be entered
+    # by more than one thread at once and raises "cannot enter context".
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        results = list(pool.map(lambda ci: _lookup_ci(ci, tenant), raw_cis))
+        futures = [pool.submit(copy_context().run, _lookup_ci, ci, tenant) for ci in raw_cis]
+        results = [f.result() for f in futures]
     enriched = [r for r in results if r is not None]
     logger.info("[Orchestrator] enriched %d/%d CIs", len(enriched), len(raw_cis))
     return enriched
@@ -541,9 +545,12 @@ def _process_payload(event: dict, context: Any = None) -> dict:
         failed_batches: set[int] = set()
         errors: list[dict] = []
 
+        # copy_context() per submit (fresh copy each time) propagates the caller's
+        # [tenant=/document=/search=] ContextVars — a single reused Context can't be entered
+        # by more than one thread at once and raises "cannot enter context".
         with ThreadPoolExecutor(max_workers=n_invoke_workers) as pool:
             futures = {
-                pool.submit(_invoke_worker, payload): payload["batch_idx"]
+                pool.submit(copy_context().run, _invoke_worker, payload): payload["batch_idx"]
                 for payload in payloads
             }
 
