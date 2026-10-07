@@ -246,6 +246,18 @@ _EVIDENCE_RANK: dict[str, int] = {
 
 _CONF_THRESHOLD = 0.2
 
+# Disagreement router (S6 post-verify): pre-LLM retrieval strength (raw agg_score, not
+# _candidate_confidence() — that formula floors at ~0.5 regardless of how weak agg_score
+# is) vs the LLM verdict. Agreement is left untouched; only the two disagreement
+# quadrants are routed to MAYBE so neither signal is ever trusted alone:
+#   strong retrieval + LLM NO  -> MAYBE (surfaces a possible false negative for review)
+#   weak retrieval   + LLM YES -> MAYBE (catches unsupported LLM accepts, e.g. agg_score
+#                                  near zero with a confident YES)
+# Named by threshold role, not as a confidence/probability — agg_score is an unbounded
+# hybrid retrieval score, not a 0-1 probability.
+_DISAGREEMENT_HIGH_RETRIEVAL_THRESHOLD = float(os.environ.get("DISAGREEMENT_HIGH_RETRIEVAL_THRESHOLD", "0.5"))
+_DISAGREEMENT_LOW_RETRIEVAL_THRESHOLD  = float(os.environ.get("DISAGREEMENT_LOW_RETRIEVAL_THRESHOLD",  "0.05"))
+
 
 def _is_related(ev: str) -> bool:
     return ev.startswith("SAME_") or ev.startswith("RELATED_") or ev == "BACKGROUND"
@@ -515,11 +527,11 @@ def _s5_rerank(req: dict, skip_rerank: bool = False) -> dict:
     passed, gated = [], []
     for c in req.get("ranked_candidates", []):
         if not c.get("matched_object"):
-            gated.append({**c, "verdict": "NO", "reason": "unresolved_no_semantic_object"})
+            gated.append({**c, "verdict": "NO", "reason": "unresolved_no_semantic_object", "llm_verified": False})
         elif _candidate_confidence(c) >= _CONF_THRESHOLD:
             passed.append(c)
         else:
-            gated.append({**c, "verdict": "NO", "reason": "candidate_confidence_gate"})
+            gated.append({**c, "verdict": "NO", "reason": "candidate_confidence_gate", "llm_verified": False})
     req["ranked_candidates"] = passed
     req.setdefault("skipped_hits", []).extend(gated)
     return req
@@ -538,7 +550,9 @@ def _s6_llm_verify(req: dict, skip_verify: bool = False) -> dict:
     t0 = time.perf_counter()
     if skip_verify:
         req["verified_candidates"] = [
-            {**c, "verdict": "MAYBE", "reason": "skipped", "confidence": 0.5}
+            # llm_verified=False: no real verdict was produced, so the disagreement
+            # router below must not treat this as an LLM judgement to agree/disagree with.
+            {**c, "verdict": "MAYBE", "reason": "skipped", "confidence": 0.5, "llm_verified": False}
             for c in req.get("ranked_candidates", [])
         ]
         req["_st"]["per_verifier_call_s"]    = {}
@@ -568,6 +582,8 @@ def _s6_llm_verify(req: dict, skip_verify: bool = False) -> dict:
 
         verifier._invoke = _timed
         req = verifier._process(req)
+        for c in req["verified_candidates"]:
+            c["llm_verified"] = True
         req["_st"]["per_verifier_call_s"]    = {i + 1: t for i, t in enumerate(call_times)}
         req["_st"]["actual_verifier_tokens"] = {
             "input":  sum(t["input"]  for t in call_tokens),
@@ -579,6 +595,7 @@ def _s6_llm_verify(req: dict, skip_verify: bool = False) -> dict:
     # rejoin them here so _clean_result's rejected_hits picks them up.
     req["verified_candidates"].extend(req.pop("skipped_hits", []))
     _downgrade_statistical_conflicts(req.get("verified_candidates", []))
+    _apply_disagreement_router(req.get("verified_candidates", []))
     return req
 
 
@@ -605,11 +622,46 @@ def _downgrade_statistical_conflicts(candidates: list) -> None:
             continue
         c["verdict"] = "MAYBE"
         c["structural_conflict"] = conflict
-        c["reason"] = (
-            f"{c.get('reason', '')} "
-            f"[downgraded: structured comparator found statistical conflict "
-            f"{conflict.get('evidence', {}).get('conflict')}]"
-        ).strip()
+        # Kept separate from `reason` — that field is the LLM's verbatim verdict
+        # explanation shown in the UI and must not be mutated/appended to.
+        c["verdict_override_reason"] = (
+            f"downgraded: structured comparator found statistical conflict "
+            f"{conflict.get('evidence', {}).get('conflict')}"
+        )
+    return
+
+
+def _apply_disagreement_router(candidates: list) -> None:
+    """Route pre-LLM-vs-LLM disagreements to MAYBE instead of trusting either signal alone.
+
+    Only candidates with an explicit llm_verified=True flag are considered — S5-gated
+    candidates never got a real LLM verdict, so a low agg_score there isn't a
+    "disagreement", it's the deterministic pre-LLM gate working as designed. Checking
+    the explicit flag (set right after verifier._process/skip_verify, see _s6_llm_verify)
+    rather than inferring it from the `reason` string keeps this safe if a later stage
+    rewrites `reason` for an unrelated purpose.
+    """
+    for c in candidates:
+        if not c.get("llm_verified"):
+            continue
+        agg_score = c.get("agg_score")
+        if agg_score is None:
+            continue
+        verdict = c.get("verdict")
+        # Kept separate from `reason` — that field is the LLM's verbatim verdict
+        # explanation shown in the UI and must not be mutated/appended to.
+        if verdict == "NO" and agg_score >= _DISAGREEMENT_HIGH_RETRIEVAL_THRESHOLD:
+            c["verdict"] = "MAYBE"
+            c["disagreement_route"] = "strong_retrieval_llm_no"
+            c["verdict_override_reason"] = (
+                f"resurfaced: strong pre-LLM retrieval (agg_score={agg_score}) but LLM said NO"
+            )
+        elif verdict == "YES" and agg_score <= _DISAGREEMENT_LOW_RETRIEVAL_THRESHOLD:
+            c["verdict"] = "MAYBE"
+            c["disagreement_route"] = "weak_retrieval_llm_yes"
+            c["verdict_override_reason"] = (
+                f"downgraded: LLM said YES but pre-LLM retrieval is weak (agg_score={agg_score})"
+            )
     return
 
 
@@ -669,6 +721,11 @@ def _s9_evidence_classify(req: dict, skip_verify: bool = False) -> dict:
                 if _is_related(ec_clean["evidence_type"]):
                     hit["verdict"] = "RELATED"
                 elif ec_clean["evidence_type"] == "UNRELATED":
+                    # Deliberately allowed to override a disagreement-router MAYBE
+                    # (see _apply_disagreement_router): this is a third, independent
+                    # evidence signal, not a re-litigation of the same LLM verdict —
+                    # a hard NO should require weak retrieval + LLM NO + no supporting
+                    # downstream evidence, and UNRELATED here is exactly that absence.
                     hit["verdict"] = "NO"
         hits.sort(key=lambda h: (
             _EVIDENCE_RANK.get(h.get("evidence_type", "BACKGROUND"), 4),
@@ -1054,6 +1111,9 @@ def _hit_with_provenance(hit: dict, debug: bool = False) -> dict:
         "agg_score":             hit.get("agg_score"),
         "score_breakdown":       hit.get("score_breakdown"),
         "agg_score_breakdown":   hit.get("agg_score_breakdown"),
+        "llm_verified":          hit.get("llm_verified"),
+        "disagreement_route":    hit.get("disagreement_route"),
+        "verdict_override_reason": hit.get("verdict_override_reason"),
         # Full detail in debug mode (S3 debug.json); trimmed for the orchestrator's
         # inline response since the UI only reads geometry/ids (see createHighlight.ts).
         "indexed_object":        _indexed_object(hit) if debug else _indexed_object_minimal(hit),
@@ -1242,6 +1302,11 @@ def _full_candidate_record(v: dict) -> dict:
         "verifier_highlight_type":        v.get("highlight_type", "sentence"),
         "verifier_primary_support_index": v.get("primary_support_index", 0),
         "verifier_tokens":      v.get("_tokens"),   # actual input/output token counts from Bedrock
+        # ── Disagreement router (pre-LLM agg_score vs LLM verdict) ────────
+        "llm_verified":           v.get("llm_verified"),
+        "disagreement_route":     v.get("disagreement_route"),
+        "structural_conflict":    v.get("structural_conflict"),
+        "verdict_override_reason": v.get("verdict_override_reason"),
         # ── Reranker scores ──────────────────────────────────────────────
         "cross_encoder_score":  v.get("cross_encoder_score") or sb.get("ce"),
         "agg_score":            v.get("agg_score"),
@@ -1353,6 +1418,9 @@ def _clean_result(result: dict,debug: bool = False) -> dict:
             "agg_score":     v.get("agg_score"),
             "score_breakdown": v.get("score_breakdown"),
             "agg_score_breakdown": v.get("agg_score_breakdown"),
+            "llm_verified":  v.get("llm_verified"),
+            "disagreement_route": v.get("disagreement_route"),
+            "verdict_override_reason": v.get("verdict_override_reason"),
             "indexed_object": _indexed_object(v),
             **_provenance(v),
         }
@@ -1375,6 +1443,9 @@ def _clean_result(result: dict,debug: bool = False) -> dict:
             "sources":             v.get("sources", []),
             "score_breakdown":     v.get("score_breakdown"),
             "agg_score_breakdown": v.get("agg_score_breakdown"),
+            "llm_verified":        v.get("llm_verified"),
+            "disagreement_route":  v.get("disagreement_route"),
+            "verdict_override_reason": v.get("verdict_override_reason"),
             "indexed_object":      _indexed_object(v),
             **_provenance(v),
         }

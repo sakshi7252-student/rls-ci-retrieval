@@ -120,10 +120,14 @@ _ZERO_ENRICHMENT_PENALTY = -0.25
 # CI types that use the numeric retriever.  These types carry no drug/endpoint
 # enrichment by design (the number IS the evidence) so structural penalties
 # that fire when enrichment is absent must be suppressed for them.
+# Must stay in sync with classifier/lambda_function.py's _STRATEGIES entries
+# that route to ["numeric", "literal"] — a type missing here still bypasses
+# vector/bm25 at retrieval but wrongly eats _ZERO_ENRICHMENT_PENALTY here.
 _NUMERIC_CI_TYPES: frozenset[str] = frozenset({
     # Fine-grained subtypes (current)
     "NUMERIC_SAMPLE_SIZE", "CONFIDENCE_INTERVAL", "P_VALUE",
     "HAZARD_RATIO", "ODDS_RATIO", "NUMERIC_PERCENTAGE", "MEDIAN",
+    "NUMERIC_RANGE", "TEMPORAL_CONSTRAINT", "DOSAGE", "AGE_DEMOGRAPHIC",
     # Coarse types (legacy — kept for any in-flight events)
     "NUMERIC", "STATISTICAL",
 })

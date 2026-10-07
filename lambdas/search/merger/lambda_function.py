@@ -80,6 +80,11 @@ def _merge_group(ci_id, ci_text: str, group: list[dict]) -> dict:
         "supporting_sentences": primary.get("supporting_sentences", []),
         "highlight_type": primary.get("highlight_type", "sentence"),
         "primary_support_index": primary.get("primary_support_index", 0),
+        "agg_score": primary.get("agg_score"),
+        "llm_verified": primary.get("llm_verified"),
+        "disagreement_route": next((c.get("disagreement_route") for c in ordered if c.get("disagreement_route")), None),
+        "structural_conflict": primary.get("structural_conflict"),
+        "verdict_override_reason": next((c.get("verdict_override_reason") for c in ordered if c.get("verdict_override_reason")), None),
     }
 
 
