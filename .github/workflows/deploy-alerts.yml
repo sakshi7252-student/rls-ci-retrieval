@@ -1,0 +1,353 @@
+name: Deploy Alert Lambdas
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "alerts/**"
+      - "tools/deploy_alert_stuck_extraction.sh"
+      - "tools/deploy_alert_stuck_ci_indexing.sh"
+      - "tools/deploy_alert_stuck_document_indexing.sh"
+      - "tools/deploy_alert_opensearch_health.sh"
+      - "tools/deploy_alert_queue_capacity.sh"
+      - ".github/workflows/deploy-alerts.yml"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Which alert lambda to deploy"
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - stuck-extraction
+          - stuck-ci-indexing
+          - stuck-document-indexing
+          - opensearch-health
+          - queue-capacity
+      deployment:
+        description: "Deployment environment"
+        required: false
+        default: dev
+        type: choice
+        options:
+          - dev
+          - qa
+          - cqa
+          - prod
+
+jobs:
+  config:
+    name: Resolve deployment config (${{ github.event.inputs.deployment || 'dev' }})
+    runs-on: ubuntu-latest
+    outputs:
+      deployment:   ${{ steps.set.outputs.deployment }}
+      aws_region:   ${{ steps.set.outputs.aws_region }}
+      role_arn:     ${{ steps.set.outputs.role_arn }}
+      db_host:      ${{ steps.set.outputs.db_host }}
+      db_name:      ${{ steps.set.outputs.db_name }}
+      domain_name:  ${{ steps.set.outputs.domain_name }}
+      opensearch_endpoint: ${{ steps.set.outputs.opensearch_endpoint }}
+      document_chunk_queue_regions: ${{ steps.set.outputs.document_chunk_queue_regions }}
+      sns_topic_arn: ${{ steps.set.outputs.sns_topic_arn }}
+    steps:
+      - name: Set config for deployment
+        id: set
+        run: |
+          DEPLOYMENT="${{ github.event.inputs.deployment || 'dev' }}"
+
+          case "$DEPLOYMENT" in
+            dev)
+              AWS_REGION="eu-west-1"
+              ROLE_ARN="arn:aws:iam::064051750322:role/rls-document-extraction-lambda-execution-role"
+              DB_HOST="TODO-dev-db-host"
+              DB_NAME="TODO-dev-db-name"
+              # AWS/ES CloudWatch dimension is the short domain name, NOT the
+              # full endpoint hostname (search-<domain>-<hash>.<region>.es.amazonaws.com).
+              # Confirm via: aws es list-domain-names --region eu-west-1
+              DOMAIN_NAME="rls-dev"
+              OPENSEARCH_ENDPOINT="search-rls-dev-rhitzxwnctmuyq2l4kny5kwelu.eu-west-1.es.amazonaws.com"
+              DOCUMENT_CHUNK_QUEUE_REGIONS='["eu-west-1","us-east-1","us-west-2","eu-central-1","ap-south-1"]'
+              SNS_TOPIC_ARN="arn:aws:sns:eu-west-1:064051750322:NLP_Running_TaskCount_LT_0"
+              ;;
+            qa)
+              AWS_REGION="us-east-1"
+              ROLE_ARN="arn:aws:iam::166795844383:role/rls-document-extraction-lambda-execution-role"
+              DB_HOST="TODO-qa-db-host"
+              DB_NAME="TODO-qa-db-name"
+              DOMAIN_NAME="rls-qa"
+              OPENSEARCH_ENDPOINT="search-rls-qa-u7jwn3q2hr3hxp7y2ydab34tfq.us-east-1.es.amazonaws.com"
+              DOCUMENT_CHUNK_QUEUE_REGIONS='["us-east-1","us-east-2","eu-central-1","ap-south-1"]'
+              SNS_TOPIC_ARN="arn:aws:sns:us-east-1:166795844383:NLP_Running_TaskCount_LT_0"
+              ;;
+            cqa)
+              AWS_REGION="eu-west-1"
+              ROLE_ARN="arn:aws:iam::166795844383:role/rls-document-extraction-lambda-execution-role"
+              DB_HOST="TODO-cqa-db-host"
+              DB_NAME="TODO-cqa-db-name"
+              DOMAIN_NAME="rls-cqa"
+              OPENSEARCH_ENDPOINT="search-rls-cqa-7sgyfh75bof4w5raojeqrtpwue.eu-west-1.es.amazonaws.com"
+              DOCUMENT_CHUNK_QUEUE_REGIONS='["eu-west-1"]'
+              SNS_TOPIC_ARN="arn:aws:sns:eu-west-1:166795844383:NLP_Running_TaskCount_LT_0"
+              ;;
+            prod)
+              AWS_REGION="eu-west-1"
+              ROLE_ARN="arn:aws:iam::027698832617:role/rls-document-extraction-lambda-execution-role"
+              DB_HOST="TODO-prod-db-host"
+              DB_NAME="TODO-prod-db-name"
+              DOMAIN_NAME="rls-prod"
+              OPENSEARCH_ENDPOINT="search-rls-prod-uswe3hhrfhtfq7feh3wnowy7tq.eu-west-1.es.amazonaws.com"
+              DOCUMENT_CHUNK_QUEUE_REGIONS='["eu-west-1","us-east-1","us-west-2","eu-central-1","ap-south-1"]'
+              SNS_TOPIC_ARN="arn:aws:sns:eu-west-1:027698832617:NLP_Running_TaskCount_LT_0"
+              ;;
+            *)
+              echo "Unknown deployment: $DEPLOYMENT" >&2
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "deployment=$DEPLOYMENT"
+            echo "aws_region=$AWS_REGION"
+            echo "role_arn=$ROLE_ARN"
+            echo "db_host=$DB_HOST"
+            echo "db_name=$DB_NAME"
+            echo "domain_name=$DOMAIN_NAME"
+            echo "opensearch_endpoint=$OPENSEARCH_ENDPOINT"
+            echo "document_chunk_queue_regions=$DOCUMENT_CHUNK_QUEUE_REGIONS"
+            echo "sns_topic_arn=$SNS_TOPIC_ARN"
+          } >> "$GITHUB_OUTPUT"
+
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      stuck_extraction:        ${{ steps.filter.outputs.stuck_extraction }}
+      stuck_ci_indexing:       ${{ steps.filter.outputs.stuck_ci_indexing }}
+      stuck_document_indexing: ${{ steps.filter.outputs.stuck_document_indexing }}
+      opensearch_health:       ${{ steps.filter.outputs.opensearch_health }}
+      queue_capacity:          ${{ steps.filter.outputs.queue_capacity }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            stuck_extraction:
+              - 'alerts/stuck_extraction/**'
+              - 'alerts/shared/**'
+              - 'alerts/requirements.txt'
+              - 'tools/deploy_alert_stuck_extraction.sh'
+              - '.github/workflows/deploy-alerts.yml'
+            stuck_ci_indexing:
+              - 'alerts/stuck_ci_indexing/**'
+              - 'alerts/shared/**'
+              - 'alerts/requirements.txt'
+              - 'tools/deploy_alert_stuck_ci_indexing.sh'
+              - '.github/workflows/deploy-alerts.yml'
+            stuck_document_indexing:
+              - 'alerts/stuck_document_indexing/**'
+              - 'alerts/shared/**'
+              - 'alerts/requirements.txt'
+              - 'tools/deploy_alert_stuck_document_indexing.sh'
+              - '.github/workflows/deploy-alerts.yml'
+            opensearch_health:
+              - 'alerts/opensearch_health/**'
+              - 'alerts/shared/**'
+              - 'tools/deploy_alert_opensearch_health.sh'
+              - '.github/workflows/deploy-alerts.yml'
+            queue_capacity:
+              - 'alerts/queue_capacity/**'
+              - 'alerts/shared/**'
+              - 'tools/deploy_alert_queue_capacity.sh'
+              - '.github/workflows/deploy-alerts.yml'
+
+  # ── stuck-extraction ──────────────────────────────────────────────────────────
+  deploy-stuck-extraction:
+    name: Deploy alert-stuck-extraction
+    needs: [config, changes]
+    if: |
+      (github.event_name == 'push' && needs.changes.outputs.stuck_extraction == 'true') ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.target == 'all' || github.event.inputs.target == 'stuck-extraction'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      FUNCTION_NAME:  rls-ci-retrieval-alert-stuck-extraction
+      AWS_REGION:     ${{ needs.config.outputs.aws_region }}
+      ENVIRONMENT:    ${{ needs.config.outputs.deployment }}
+      DB_HOST:        ${{ needs.config.outputs.db_host }}
+      DB_NAME:        ${{ needs.config.outputs.db_name }}
+      DB_USER:        ${{ secrets.ALERTS_DB_USER }}
+      DB_PASSWORD:    ${{ secrets.ALERTS_DB_PASSWORD }}
+      SNS_TOPIC_ARN:  ${{ needs.config.outputs.sns_topic_arn }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+      - name: Debug AWS identity
+        run: aws sts get-caller-identity
+      - name: Deploy
+        env:
+          ROLE_ARN: ${{ needs.config.outputs.role_arn }}
+        run: |
+          chmod +x tools/deploy_alert_stuck_extraction.sh
+          tools/deploy_alert_stuck_extraction.sh
+
+  # ── stuck-ci-indexing ─────────────────────────────────────────────────────────
+  deploy-stuck-ci-indexing:
+    name: Deploy alert-stuck-ci-indexing
+    needs: [config, changes]
+    if: |
+      (github.event_name == 'push' && needs.changes.outputs.stuck_ci_indexing == 'true') ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.target == 'all' || github.event.inputs.target == 'stuck-ci-indexing'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      FUNCTION_NAME:  rls-ci-retrieval-alert-stuck-ci-indexing
+      AWS_REGION:     ${{ needs.config.outputs.aws_region }}
+      ENVIRONMENT:    ${{ needs.config.outputs.deployment }}
+      DB_HOST:        ${{ needs.config.outputs.db_host }}
+      DB_NAME:        ${{ needs.config.outputs.db_name }}
+      DB_USER:        ${{ secrets.ALERTS_DB_USER }}
+      DB_PASSWORD:    ${{ secrets.ALERTS_DB_PASSWORD }}
+      SNS_TOPIC_ARN:  ${{ needs.config.outputs.sns_topic_arn }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+      - name: Debug AWS identity
+        run: aws sts get-caller-identity
+      - name: Deploy
+        env:
+          ROLE_ARN: ${{ needs.config.outputs.role_arn }}
+        run: |
+          chmod +x tools/deploy_alert_stuck_ci_indexing.sh
+          tools/deploy_alert_stuck_ci_indexing.sh
+
+  # ── stuck-document-indexing ───────────────────────────────────────────────────
+  deploy-stuck-document-indexing:
+    name: Deploy alert-stuck-document-indexing
+    needs: [config, changes]
+    if: |
+      (github.event_name == 'push' && needs.changes.outputs.stuck_document_indexing == 'true') ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.target == 'all' || github.event.inputs.target == 'stuck-document-indexing'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      FUNCTION_NAME:  rls-ci-retrieval-alert-stuck-document-indexing
+      AWS_REGION:     ${{ needs.config.outputs.aws_region }}
+      ENVIRONMENT:    ${{ needs.config.outputs.deployment }}
+      DB_HOST:        ${{ needs.config.outputs.db_host }}
+      DB_NAME:        ${{ needs.config.outputs.db_name }}
+      DB_USER:        ${{ secrets.ALERTS_DB_USER }}
+      DB_PASSWORD:    ${{ secrets.ALERTS_DB_PASSWORD }}
+      SNS_TOPIC_ARN:  ${{ needs.config.outputs.sns_topic_arn }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+      - name: Debug AWS identity
+        run: aws sts get-caller-identity
+      - name: Deploy
+        env:
+          ROLE_ARN: ${{ needs.config.outputs.role_arn }}
+        run: |
+          chmod +x tools/deploy_alert_stuck_document_indexing.sh
+          tools/deploy_alert_stuck_document_indexing.sh
+
+  # ── opensearch-health ─────────────────────────────────────────────────────────
+  deploy-opensearch-health:
+    name: Deploy alert-opensearch-health
+    needs: [config, changes]
+    if: |
+      (github.event_name == 'push' && needs.changes.outputs.opensearch_health == 'true') ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.target == 'all' || github.event.inputs.target == 'opensearch-health'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      FUNCTION_NAME:  rls-ci-retrieval-alert-opensearch-health
+      AWS_REGION:     ${{ needs.config.outputs.aws_region }}
+      ENVIRONMENT:    ${{ needs.config.outputs.deployment }}
+      DOMAIN_NAME:    ${{ needs.config.outputs.domain_name }}
+      OPENSEARCH_ENDPOINT: ${{ needs.config.outputs.opensearch_endpoint }}
+      OPEN_SEARCH_REGION:  ${{ needs.config.outputs.aws_region }}
+      SNS_TOPIC_ARN:  ${{ needs.config.outputs.sns_topic_arn }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+      - name: Debug AWS identity
+        run: aws sts get-caller-identity
+      - name: Deploy
+        env:
+          ROLE_ARN: ${{ needs.config.outputs.role_arn }}
+        run: |
+          chmod +x tools/deploy_alert_opensearch_health.sh
+          tools/deploy_alert_opensearch_health.sh
+
+  # ── queue-capacity (SQS) ───────────────────────────────────────────────────────────
+  deploy-queue-capacity:
+    name: Deploy alert-queue-capacity
+    needs: [config, changes]
+    if: |
+      (github.event_name == 'push' && needs.changes.outputs.queue_capacity == 'true') ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.target == 'all' || github.event.inputs.target == 'queue-capacity'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      FUNCTION_NAME:  rls-ci-retrieval-alert-queue-capacity
+      AWS_REGION:     ${{ needs.config.outputs.aws_region }}
+      ENVIRONMENT:    ${{ needs.config.outputs.deployment }}
+      DOCUMENT_CHUNK_QUEUE_REGIONS: ${{ needs.config.outputs.document_chunk_queue_regions }}
+      SNS_TOPIC_ARN:  ${{ needs.config.outputs.sns_topic_arn }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+      - name: Debug AWS identity
+        run: aws sts get-caller-identity
+      - name: Deploy
+        env:
+          ROLE_ARN: ${{ needs.config.outputs.role_arn }}
+        run: |
+          chmod +x tools/deploy_alert_queue_capacity.sh
+          tools/deploy_alert_queue_capacity.sh

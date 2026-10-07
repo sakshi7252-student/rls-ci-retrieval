@@ -1,0 +1,4 @@
+pg8000
+boto3
+opensearch-py
+requests-aws4auth
