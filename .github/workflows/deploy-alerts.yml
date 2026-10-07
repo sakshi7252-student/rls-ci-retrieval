@@ -46,6 +46,7 @@ jobs:
       role_arn:     ${{ steps.set.outputs.role_arn }}
       db_host:      ${{ steps.set.outputs.db_host }}
       db_name:      ${{ steps.set.outputs.db_name }}
+      db_user:      ${{ steps.set.outputs.db_user }}
       domain_name:  ${{ steps.set.outputs.domain_name }}
       opensearch_endpoint: ${{ steps.set.outputs.opensearch_endpoint }}
       document_chunk_queue_regions: ${{ steps.set.outputs.document_chunk_queue_regions }}
@@ -60,8 +61,9 @@ jobs:
             dev)
               AWS_REGION="eu-west-1"
               ROLE_ARN="arn:aws:iam::064051750322:role/rls-document-extraction-lambda-execution-role"
-              DB_HOST="TODO-dev-db-host"
-              DB_NAME="TODO-dev-db-name"
+              DB_HOST="dev-rls.ceh23bpahliq.eu-west-1.rds.amazonaws.com"
+              DB_NAME="rls_dev"
+              DB_USER="rls"
               # AWS/ES CloudWatch dimension is the short domain name, NOT the
               # full endpoint hostname (search-<domain>-<hash>.<region>.es.amazonaws.com).
               # Confirm via: aws es list-domain-names --region eu-west-1
@@ -73,8 +75,9 @@ jobs:
             qa)
               AWS_REGION="us-east-1"
               ROLE_ARN="arn:aws:iam::166795844383:role/rls-document-extraction-lambda-execution-role"
-              DB_HOST="TODO-qa-db-host"
-              DB_NAME="TODO-qa-db-name"
+              DB_HOST="qa-rls.c9ylbkyauxep.us-east-1.rds.amazonaws.com"
+              DB_NAME="rls_qa"
+              DB_USER="rls"
               DOMAIN_NAME="rls-qa"
               OPENSEARCH_ENDPOINT="search-rls-qa-u7jwn3q2hr3hxp7y2ydab34tfq.us-east-1.es.amazonaws.com"
               DOCUMENT_CHUNK_QUEUE_REGIONS='["us-east-1","us-east-2","eu-central-1","ap-south-1"]'
@@ -83,8 +86,9 @@ jobs:
             cqa)
               AWS_REGION="eu-west-1"
               ROLE_ARN="arn:aws:iam::166795844383:role/rls-document-extraction-lambda-execution-role"
-              DB_HOST="TODO-cqa-db-host"
-              DB_NAME="TODO-cqa-db-name"
+              DB_HOST="cqa-app.cfkt5yoaoueu.eu-west-1.rds.amazonaws.com"
+              DB_NAME="app_cqa"
+              DB_USER="cqa"
               DOMAIN_NAME="rls-cqa"
               OPENSEARCH_ENDPOINT="search-rls-cqa-7sgyfh75bof4w5raojeqrtpwue.eu-west-1.es.amazonaws.com"
               DOCUMENT_CHUNK_QUEUE_REGIONS='["eu-west-1"]'
@@ -93,8 +97,9 @@ jobs:
             prod)
               AWS_REGION="eu-west-1"
               ROLE_ARN="arn:aws:iam::027698832617:role/rls-document-extraction-lambda-execution-role"
-              DB_HOST="TODO-prod-db-host"
-              DB_NAME="TODO-prod-db-name"
+              DB_HOST="prod-rls.cqlob46xofmf.eu-west-1.rds.amazonaws.com"
+              DB_NAME="rls_prod"
+              DB_USER="rls"
               DOMAIN_NAME="rls-prod"
               OPENSEARCH_ENDPOINT="search-rls-prod-uswe3hhrfhtfq7feh3wnowy7tq.eu-west-1.es.amazonaws.com"
               DOCUMENT_CHUNK_QUEUE_REGIONS='["eu-west-1","us-east-1","us-west-2","eu-central-1","ap-south-1"]'
@@ -112,6 +117,7 @@ jobs:
             echo "role_arn=$ROLE_ARN"
             echo "db_host=$DB_HOST"
             echo "db_name=$DB_NAME"
+            echo "db_user=$DB_USER"
             echo "domain_name=$DOMAIN_NAME"
             echo "opensearch_endpoint=$OPENSEARCH_ENDPOINT"
             echo "document_chunk_queue_regions=$DOCUMENT_CHUNK_QUEUE_REGIONS"
@@ -178,8 +184,7 @@ jobs:
       ENVIRONMENT:    ${{ needs.config.outputs.deployment }}
       DB_HOST:        ${{ needs.config.outputs.db_host }}
       DB_NAME:        ${{ needs.config.outputs.db_name }}
-      DB_USER:        ${{ secrets.ALERTS_DB_USER }}
-      DB_PASSWORD:    ${{ secrets.ALERTS_DB_PASSWORD }}
+      DB_USER:        ${{ needs.config.outputs.db_user }}
       SNS_TOPIC_ARN:  ${{ needs.config.outputs.sns_topic_arn }}
 
     steps:
@@ -218,8 +223,7 @@ jobs:
       ENVIRONMENT:    ${{ needs.config.outputs.deployment }}
       DB_HOST:        ${{ needs.config.outputs.db_host }}
       DB_NAME:        ${{ needs.config.outputs.db_name }}
-      DB_USER:        ${{ secrets.ALERTS_DB_USER }}
-      DB_PASSWORD:    ${{ secrets.ALERTS_DB_PASSWORD }}
+      DB_USER:        ${{ needs.config.outputs.db_user }}
       SNS_TOPIC_ARN:  ${{ needs.config.outputs.sns_topic_arn }}
 
     steps:
@@ -258,8 +262,7 @@ jobs:
       ENVIRONMENT:    ${{ needs.config.outputs.deployment }}
       DB_HOST:        ${{ needs.config.outputs.db_host }}
       DB_NAME:        ${{ needs.config.outputs.db_name }}
-      DB_USER:        ${{ secrets.ALERTS_DB_USER }}
-      DB_PASSWORD:    ${{ secrets.ALERTS_DB_PASSWORD }}
+      DB_USER:        ${{ needs.config.outputs.db_user }}
       SNS_TOPIC_ARN:  ${{ needs.config.outputs.sns_topic_arn }}
 
     steps:

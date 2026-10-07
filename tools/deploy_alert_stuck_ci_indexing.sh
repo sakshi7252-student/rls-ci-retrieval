@@ -2,14 +2,17 @@
 # Deploy the rls-ci-retrieval-alert-stuck-ci-indexing Lambda (zip-based, pure Python).
 #
 # Required env vars:
-#   ROLE_ARN, DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, SNS_TOPIC_ARN
+#   ROLE_ARN, DB_HOST, DB_NAME, DB_USER, SNS_TOPIC_ARN
 #
 # Optional overrides:
 #   FUNCTION_NAME, AWS_REGION, TIMEOUT, MEMORY_SIZE, ENVIRONMENT
 #
+# DB_PASSWORD is NOT managed here: set it once directly on the Lambda console/CLI.
+# --environment is only passed on first create, never on update, so it's preserved forever.
+#
 # Example:
 #   ROLE_ARN=arn:aws:iam::<acct>:role/... DB_HOST=... DB_NAME=... DB_USER=... \
-#   DB_PASSWORD=... SNS_TOPIC_ARN=arn:aws:sns:... \
+#   SNS_TOPIC_ARN=arn:aws:sns:... \
 #   tools/deploy_alert_stuck_ci_indexing.sh
 set -euo pipefail
 
@@ -27,10 +30,9 @@ ENVIRONMENT="${ENVIRONMENT:-dev}"
 DB_HOST="${DB_HOST:-}"
 DB_NAME="${DB_NAME:-}"
 DB_USER="${DB_USER:-}"
-DB_PASSWORD="${DB_PASSWORD:-}"
 SNS_TOPIC_ARN="${SNS_TOPIC_ARN:-}"
 
-for var in ROLE_ARN DB_HOST DB_NAME DB_USER DB_PASSWORD SNS_TOPIC_ARN; do
+for var in ROLE_ARN DB_HOST DB_NAME DB_USER SNS_TOPIC_ARN; do
   if [[ -z "${!var}" ]]; then
     echo "ERROR: $var is required"
     exit 1
@@ -52,7 +54,8 @@ cp "$ROOT_DIR/$ALERT_DIR"/*.py "$BUILD_DIR/"
 ZIP_PATH="$BUILD_DIR/../$(basename "$FUNCTION_NAME").zip"
 (cd "$BUILD_DIR" && zip -q -r "$ZIP_PATH" .)
 
-ENV_VARS="Variables={DB_HOST=$DB_HOST,DB_NAME=$DB_NAME,DB_USER=$DB_USER,DB_PASSWORD=$DB_PASSWORD,SNS_TOPIC_ARN=$SNS_TOPIC_ARN,ENVIRONMENT=$ENVIRONMENT}"
+# DB_PASSWORD is deliberately excluded -- set once on the Lambda directly, never overwritten here.
+ENV_VARS="Variables={DB_HOST=$DB_HOST,DB_NAME=$DB_NAME,DB_USER=$DB_USER,SNS_TOPIC_ARN=$SNS_TOPIC_ARN,ENVIRONMENT=$ENVIRONMENT}"
 
 wait_for_lambda_update() {
   aws lambda wait function-updated-v2 --function-name "$FUNCTION_NAME" --region "$AWS_REGION"
@@ -65,13 +68,13 @@ if aws lambda get-function --function-name "$FUNCTION_NAME" --region "$AWS_REGIO
     --zip-file "fileb://$ZIP_PATH" \
     --region "$AWS_REGION" >/dev/null
   wait_for_lambda_update
+  # --environment intentionally omitted on update: never touch existing env vars (e.g. DB_PASSWORD).
   aws lambda update-function-configuration \
     --function-name "$FUNCTION_NAME" \
     --runtime "$RUNTIME" \
     --handler "$HANDLER" \
     --timeout "$TIMEOUT" \
     --memory-size "$MEMORY_SIZE" \
-    --environment "$ENV_VARS" \
     --region "$AWS_REGION" >/dev/null
   wait_for_lambda_update
 else
