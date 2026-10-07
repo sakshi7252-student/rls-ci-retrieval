@@ -1048,8 +1048,13 @@ def _extract_statistical_identity(text: str) -> dict:
         if unit in _STAT_TIME_UNITS:
             result["median_unit"] = unit
 
-    # 7. Standalone percentage (only when no CI bounds or p-value already found)
-    if "lower_ci" not in result and "p_value" not in result:
+    # 7. Standalone percentage — skip only when CI bounds already consumed the
+    # "X% CI" portion of the match (that % belongs to confidence_level, not a
+    # separate percentage fact). p-value never contains a "%" in its own
+    # regex, so it cannot collide here and must not suppress percentage
+    # extraction — a sentence can state both a p-value and an unrelated
+    # percentage (e.g. "90% power ... p = 0.05") and both are real facts.
+    if "lower_ci" not in result:
         pct_matches = _PERCENTAGE_STAT_RE.findall(text)
         if pct_matches:
             try:

@@ -9,6 +9,12 @@ from __future__ import annotations
 
 import re
 
+try:
+    from shared.clinical_fact_extractor import _extract_statistical_identity
+except ImportError:
+    _extract_statistical_identity = None
+
+
 # ─── Severity levels ──────────────────────────────────────────────────────────
 # Single source of truth for severity strings used across the validation engine.
 _SEV_NONE   = "NONE"
@@ -123,6 +129,20 @@ class ClinicalContext:
         self.statistical_identity  = statistical_identity
 
 
+def _refresh_statistical_identity(text: str, stored: dict) -> dict:
+    """Re-extract statistical facts from the object's own text at query time —
+    stale/incomplete pre-indexed enrichment (older docs indexed before an
+    extractor fix) must not silently suppress a real conflict. Freshly
+    extracted values win on key collision; re-indexing is not required."""
+    if not text or _extract_statistical_identity is None:
+        return stored
+    try:
+        fresh = _extract_statistical_identity(text)
+    except Exception:
+        return stored
+    return {**stored, **fresh} if fresh else stored
+
+
 def _build_ci_context(ci: dict, entities: list) -> "ClinicalContext":
     """Build a ClinicalContext from req['ci'] (the CI dict from OpenSearch)."""
     return ClinicalContext(
@@ -135,7 +155,9 @@ def _build_ci_context(ci: dict, entities: list) -> "ClinicalContext":
         modality             = (ci.get("modality") or "GENERAL").upper(),
         entities             = entities,
         identity_overlap     = {},   # N/A for the CI itself
-        statistical_identity = ci.get("statistical_identity") or {},
+        statistical_identity = _refresh_statistical_identity(
+            ci.get("knownCI", ""), ci.get("statistical_identity") or {}
+        ),
     )
 
 
@@ -152,7 +174,9 @@ def _build_cand_context(cand: dict) -> "ClinicalContext":
         modality             = (obj.get("modality") or "GENERAL").upper(),
         entities             = obj.get("entities") or [],
         identity_overlap     = cand.get("identity_overlap") or {},
-        statistical_identity = obj.get("statistical_identity") or {},
+        statistical_identity = _refresh_statistical_identity(
+            obj.get("text", ""), obj.get("statistical_identity") or {}
+        ),
     )
 
 
