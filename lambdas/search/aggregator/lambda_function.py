@@ -524,6 +524,7 @@ def _merge(retriever_results: list[dict]) -> list[dict]:
                     "snippet":        hit.get("snippet", ""),
                     "matched_object": None,
                     "literal_matches": [],
+                    "retrieval_evidence": [],  # [{retriever, search_terms}] — chunk-fallback grounding signal
                     "_best_score":    0.0,
                     "_per_scores":    {},   # retriever → best score from that retriever
                 }
@@ -547,6 +548,13 @@ def _merge(retriever_results: list[dict]) -> list[dict]:
                     if lm["start"] not in existing_starts:
                         entry["literal_matches"].append(lm)
                         existing_starts.add(lm["start"])
+
+            # Carry a fuzzy retriever's own matching terms forward too (e.g. ontology
+            # synonyms, NER entity text) — the Grounder's chunk-fallback scoring uses
+            # this instead of losing the signal and scoring against the CI alone.
+            evidence = hit.get("retrieval_evidence")
+            if evidence and not any(e.get("retriever") == retriever for e in entry["retrieval_evidence"]):
+                entry["retrieval_evidence"].append(evidence)
 
             score = hit.get("score", 0.0)
             if score > entry["_per_scores"].get(retriever, 0.0):

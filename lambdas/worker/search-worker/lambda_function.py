@@ -551,6 +551,10 @@ def _s6_llm_verify(req: dict, skip_verify: bool = False) -> dict:
             "output": sum(t["output"] for t in call_tokens),
         }
     req["_st"]["llm_verifier"] = round(time.perf_counter() - t0, 3)
+    # S5-gated candidates (unresolved_no_semantic_object / candidate_confidence_gate) never
+    # reach the verifier above, but without this they vanish from the debug json entirely —
+    # rejoin them here so _clean_result's rejected_hits picks them up.
+    req["verified_candidates"].extend(req.pop("skipped_hits", []))
     return req
 
 

@@ -39,8 +39,6 @@ reuses this instead of re-fetching, and slices it to a ±window for context buil
 from __future__ import annotations
 
 import logging
-import math
-import operator
 import os
 import re
 from collections import Counter
@@ -74,6 +72,10 @@ GROUNDING_MAX_LOCAL_OBJECTS = int(os.environ.get("GROUNDING_MAX_LOCAL_OBJECTS", 
 GROUNDING_SCORE_MARGIN      = float(os.environ.get("GROUNDING_SCORE_MARGIN", "0.10"))
 GROUNDING_MIN_VECTOR_SCORE  = float(os.environ.get("GROUNDING_MIN_VECTOR_SCORE", "0.20"))
 GROUNDING_MIN_LEXICAL_SCORE = float(os.environ.get("GROUNDING_MIN_LEXICAL_SCORE", "0.30"))
+# Chunk fallback blend: when the retriever reports its own matched terms (ontology
+# synonyms, NER entity text), weight that signal over generic CI-token/vector overlap —
+# it tells us WHY the chunk was retrieved, which plain CI scoring throws away.
+GROUNDING_RETRIEVAL_TERM_WEIGHT = float(os.environ.get("GROUNDING_RETRIEVAL_TERM_WEIGHT", "0.7"))
 
 _LITERAL_SPAN_CONFIDENCE  = 0.95
 _COVERED_SPAN_CONFIDENCE  = 0.80
@@ -144,7 +146,7 @@ def _process(req: dict) -> dict:
             continue
 
         pool = pools.get(c.get("chunk_id", ""), [])
-        picks, reason = _ground_chunk_candidate(c, ci, pool)
+        picks, reason = _ground_chunk_candidate(c, ci, pool, document_id, tenant_id, project_id)
         if not picks:
             grounded.append({
                 **c, "matched_object": None, "_chunk_pool": pool,
@@ -188,6 +190,10 @@ def _fetch_chunk_pools(
                 *([{"term": {"project_id": project_id}}] if project_id else []),
             ]}},
             "sort": [{"global_position": "asc"}],
+            # Vectors are never read client-side (local_vector scoring now runs as an
+            # OpenSearch script_score query) — excluding them here avoids pulling a
+            # 1024-dim float array per object over the wire for every chunk candidate.
+            "_source": {"excludes": ["dense_vector", "heading_dense_vector"]},
         })
     pools: dict[str, list[dict]] = {}
     try:
@@ -221,6 +227,7 @@ def _fetch_chunk_pools(
                     *([{"term": {"project_id": project_id}}] if project_id else []),
                 ]}},
                 "sort": [{"global_position": "asc"}],
+                "_source": {"excludes": ["dense_vector", "heading_dense_vector"]},
             })
         if not keys:
             break
@@ -250,6 +257,20 @@ def _normalize_for_dedup(text: str) -> str:
 
 def _parent_object_id(obj: dict) -> str:
     return re.sub(r"_s\d+$", "", obj.get("object_id") or "")
+
+
+def _retrieval_term_overlap(text: str, terms: list[str]) -> float:
+    """Fraction of the retriever's own matched terms (ontology synonym, NER entity text,
+    ...) found as a substring of this object's text — phrase containment, not bag-of-words,
+    since a multi-word term like "high blood pressure" scored by token-overlap alone would
+    dilute against unrelated objects that merely share "high" or "pressure"."""
+    if not terms:
+        return 0.0
+    norm_text = _normalize_for_dedup(text)
+    if not norm_text:
+        return 0.0
+    hits = sum(1 for t in terms if _normalize_for_dedup(t) and _normalize_for_dedup(t) in norm_text)
+    return hits / len(terms)
 
 
 def _hierarchy_related(a: dict, b: dict) -> bool:
@@ -326,16 +347,61 @@ def _ground_by_spans(matches: list[dict], pool: list[dict]) -> list[tuple[dict, 
     ]
 
 
-def _cosine(a: list[float], b: list[float]) -> float:
-    if not a or len(a) != len(b):
-        return 0.0
-    na = math.sqrt(sum(map(operator.mul, a, a)))
-    nb = math.sqrt(sum(map(operator.mul, b, b)))
-    return sum(map(operator.mul, a, b)) / (na * nb) if na and nb else 0.0
+def _opensearch_cosine_scores(
+    ci_vec:      list[float],
+    object_ids:  list[str],
+    document_id: str | None,
+    tenant_id:   str | None,
+    project_id:  str | None,
+) -> dict[str, float]:
+    """Exact cosine similarity against the CI, computed server-side via a script_score
+    query instead of pulling every object's 1024-dim vector into Lambda to do the math
+    in Python — OpenSearch already holds the vectors and the index is small per chunk."""
+    if not object_ids or not ci_vec:
+        return {}
+    body = {
+        "size": len(object_ids),
+        "query": {
+            "script_score": {
+                "query": {"bool": {"filter": [
+                    {"terms":  {"object_id": object_ids}},
+                    {"exists": {"field": "dense_vector"}},
+                    *([{"term": {"document_id": document_id}}] if document_id else []),
+                    *([{"term": {"tenant_id": tenant_id}}] if tenant_id else []),
+                    *([{"term": {"project_id": project_id}}] if project_id else []),
+                ]}},
+                # +1.0 because OpenSearch script_score requires non-negative scores;
+                # undone below when reading the result back out.
+                "script": {
+                    "source": "cosineSimilarity(params.query_vector, doc['dense_vector']) + 1.0",
+                    "params": {"query_vector": ci_vec},
+                },
+            }
+        },
+        "_source": False,
+        "docvalue_fields": ["object_id"],
+    }
+    try:
+        resp = _get_os().search(index=SEMANTIC_OBJECTS_INDEX, body=body)
+    except Exception as exc:
+        logger.warning("[Evidence Grounder] opensearch cosine scoring failed: %s", exc)
+        return {}
+    scores: dict[str, float] = {}
+    for h in resp.get("hits", {}).get("hits", []):
+        oid_field = h.get("fields", {}).get("object_id")
+        oid = oid_field[0] if oid_field else None
+        if oid:
+            scores[oid] = h.get("_score", 1.0) - 1.0
+    return scores
 
 
-def _ground_by_local_score(ci: dict, pool: list[dict]) -> list[tuple[dict, dict]]:
-    """No exact span: rank this chunk's own objects against the CI and keep the top few."""
+def _ground_by_local_score(
+    ci: dict, pool: list[dict], retrieval_evidence: list[dict] | None = None,
+    document_id: str | None = None, tenant_id: str | None = None, project_id: str | None = None,
+) -> list[tuple[dict, dict]]:
+    """No exact span: rank this chunk's own objects against the CI (and, when the
+    retriever reported its own matched terms, against those terms too) and keep the
+    top few."""
     sentence_parents = {_parent_object_id(o) for o in pool if o.get("type") == "sentence"}
     eligible = [
         o for o in pool
@@ -346,21 +412,39 @@ def _ground_by_local_score(ci: dict, pool: list[dict]) -> list[tuple[dict, dict]
     if not eligible:
         return []
 
+    terms: list[str] = []
+    for ev in (retrieval_evidence or []):
+        terms.extend(ev.get("search_terms") or [])
+
     ci_vec = (ci.get("embedding") or {}).get("dense_vector") or []
-    use_vector = bool(ci_vec) and 2 * sum(1 for o in eligible if o.get("dense_vector")) >= len(eligible)
+    vector_scores = (
+        _opensearch_cosine_scores(ci_vec, [o["object_id"] for o in eligible], document_id, tenant_id, project_id)
+        if ci_vec else {}
+    )
+    use_vector = bool(vector_scores) and 2 * len(vector_scores) >= len(eligible)
     if use_vector:
-        method, floor = "local_vector", GROUNDING_MIN_VECTOR_SCORE
-        scored = [(_cosine(ci_vec, o["dense_vector"]), o) for o in eligible if o.get("dense_vector")]
+        ci_method, ci_scores = "local_vector", vector_scores
     else:
-        method, floor = "local_lexical", GROUNDING_MIN_LEXICAL_SCORE
+        ci_method = "local_lexical"
         ci_text = " ".join((ci.get("normalization") or {}).get("tokens") or []) or ci.get("knownCI") or ""
         ci_tokens = {t for t in _normalize_for_dedup(ci_text).split() if len(t) >= 3}
-        if not ci_tokens:
-            return []
+        ci_scores = {
+            o["object_id"]: len(ci_tokens & set(_normalize_for_dedup(o["text"]).split())) / len(ci_tokens)
+            for o in eligible
+        } if ci_tokens else {}
+
+    if terms:
+        method, floor = "local_retrieval_terms", GROUNDING_MIN_LEXICAL_SCORE
+        w = GROUNDING_RETRIEVAL_TERM_WEIGHT
         scored = [
-            (len(ci_tokens & set(_normalize_for_dedup(o["text"]).split())) / len(ci_tokens), o)
+            (w * _retrieval_term_overlap(o.get("text") or "", terms) + (1 - w) * ci_scores.get(o["object_id"], 0.0), o)
             for o in eligible
         ]
+    elif ci_scores:
+        method, floor = ci_method, (GROUNDING_MIN_VECTOR_SCORE if use_vector else GROUNDING_MIN_LEXICAL_SCORE)
+        scored = [(ci_scores.get(o["object_id"], 0.0), o) for o in eligible]
+    else:
+        return []
 
     scored.sort(key=lambda s: (-s[0], s[1].get("global_position") or 0))
     if not scored or scored[0][0] < floor:
@@ -373,11 +457,14 @@ def _ground_by_local_score(ci: dict, pool: list[dict]) -> list[tuple[dict, dict]
     ]
 
 
-def _ground_chunk_candidate(candidate: dict, ci: dict, pool: list[dict]) -> tuple[list[tuple[dict, dict]], str | None]:
+def _ground_chunk_candidate(
+    candidate: dict, ci: dict, pool: list[dict],
+    document_id: str | None = None, tenant_id: str | None = None, project_id: str | None = None,
+) -> tuple[list[tuple[dict, dict]], str | None]:
     """Ground a chunk-level candidate. Returns (picks, unresolved_reason)."""
     if not any((o.get("text") or "").strip() for o in pool):
         return [], "no_semantic_objects_for_chunk"
     picks = _ground_by_spans(candidate.get("literal_matches") or [], pool)
     if not picks:
-        picks = _ground_by_local_score(ci, pool)
+        picks = _ground_by_local_score(ci, pool, candidate.get("retrieval_evidence"), document_id, tenant_id, project_id)
     return (picks, None) if picks else ([], "no_reliable_anchor")

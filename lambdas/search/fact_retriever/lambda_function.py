@@ -78,6 +78,22 @@ _REL_TYPE_BOOST = float(os.environ.get("FACT_REL_TYPE_BOOST", "1.5"))
 # Merge: combined = max_score + MERGE_ALPHA * second_best_score
 MERGE_ALPHA = float(os.environ.get("FACT_MERGE_ALPHA", "0.30"))
 
+# Boost applied when a candidate's text contains a numeric literal (e.g. "70.0")
+# also present in the CI text. No structured slot captures specific values
+# (endpoint/population are label-only), so without this, a candidate naming the
+# right drug/endpoint but the WRONG number scores identically to the right one.
+FACT_NUMERIC_BOOST = float(os.environ.get("FACT_NUMERIC_BOOST", "6.0"))
+
+import re as _re
+_NUMERIC_TOKEN_RE = _re.compile(r"\d+(?:\.\d+)?")
+
+
+def _extract_numeric_tokens(ci_text: str) -> list[str]:
+    """Pull numeric literals (e.g. "70.0", "100") out of the raw CI text."""
+    if not ci_text:
+        return []
+    return sorted(set(_NUMERIC_TOKEN_RE.findall(ci_text)))
+
 # Whether to use Painless script confidence boosting in the relation query
 USE_CONFIDENCE_BOOST = os.environ.get("FACT_USE_CONFIDENCE_BOOST", "true").lower() == "true"
 
@@ -172,6 +188,7 @@ def _process(req: dict) -> dict:
     ci_relations     = ci.get("clinical_relations", [])
     ci_stmt_type     = ci.get("statement_type", "")
     ci_study_context = ci.get("study_context", "GENERAL")
+    ci_numeric_tokens = _extract_numeric_tokens(ci.get("knownCI", ""))
     document_id      = req.get("document_id")
     tenant = req.get("tenant")
     project_id = req.get("project_id")
@@ -181,7 +198,7 @@ def _process(req: dict) -> dict:
     k          = _adaptive_k(page_count, TOP_K)
 
     # Stage 1: flat-fact + statement_type + study_context search
-    fact_hits = _fact_search(ci_facts, ci_stmt_type, ci_study_context, document_id, tenant_id=tenant_id, project_id=project_id, k=k)
+    fact_hits = _fact_search(ci_facts, ci_stmt_type, ci_study_context, document_id, tenant_id=tenant_id, project_id=project_id, k=k, ci_numeric_tokens=ci_numeric_tokens)
 
     # Stage 2: clinical-relation search (skip if no relations extracted)
     rel_hits  = _relation_search(ci_relations, document_id, tenant_id=tenant_id, project_id=project_id, k=k) if ci_relations else []
@@ -202,8 +219,9 @@ def _fact_search(
     tenant_id:        str | None = None,
     project_id:       str | None = None,
     k:                int = TOP_K,
+    ci_numeric_tokens: list[str] | None = None,
 ) -> list[dict]:
-    body = _build_fact_query(ci_facts, ci_stmt_type, ci_study_context, document_id, tenant_id=tenant_id, project_id=project_id)
+    body = _build_fact_query(ci_facts, ci_stmt_type, ci_study_context, document_id, tenant_id=tenant_id, project_id=project_id, ci_numeric_tokens=ci_numeric_tokens)
     if body is None:
         logger.debug("[Fact Retriever] no usable facts — skipping stage 1")
         return []
@@ -223,6 +241,7 @@ def _build_fact_query(
     document_id:      str | None,
     tenant_id:        str | None = None,
     project_id:       str | None = None,
+    ci_numeric_tokens: list[str] | None = None,
 ) -> dict | None:
     """
     Stage 1 query: one `match` clause per entity value (not joined into a
@@ -255,6 +274,15 @@ def _build_fact_query(
     if ci_study_context in ("CURRENT", "GENERAL"):
         should_clauses.append(
             {"term": {"study_context": {"value": "CURRENT", "boost": 1.5}}}
+        )
+
+    # Numeric-value boost: slots are label-only (e.g. endpoint="mean baseline
+    # weight"), so a candidate naming the right drug/endpoint but a different
+    # number scores identically to the one with the right number. Reward
+    # candidates whose text contains the same numeric literal as the CI.
+    for token in (ci_numeric_tokens or []):
+        should_clauses.append(
+            {"match_phrase": {"text": {"query": token, "boost": FACT_NUMERIC_BOOST}}}
         )
 
     # Hard anchor: at least one high-specificity slot must match
