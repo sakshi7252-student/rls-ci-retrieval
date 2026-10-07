@@ -115,4 +115,28 @@ else
   wait_for_lambda_update
 fi
 
+# Hourly invocation via EventBridge, same pattern as the existing NLP_Error_Notification/Hourly rule.
+SCHEDULE_RULE_NAME="${SCHEDULE_RULE_NAME:-${FUNCTION_NAME}-hourly}"
+SCHEDULE_EXPRESSION="${SCHEDULE_EXPRESSION:-rate(1 hour)}"
+FUNCTION_ARN="$(aws lambda get-function --function-name "$FUNCTION_NAME" --region "$AWS_REGION" --query 'Configuration.FunctionArn' --output text)"
+RULE_ARN="$(aws events put-rule \
+  --name "$SCHEDULE_RULE_NAME" \
+  --schedule-expression "$SCHEDULE_EXPRESSION" \
+  --state ENABLED \
+  --region "$AWS_REGION" \
+  --query 'RuleArn' --output text)"
+ADD_PERM_OUTPUT=$(aws lambda add-permission \
+  --function-name "$FUNCTION_NAME" \
+  --statement-id "$SCHEDULE_RULE_NAME" \
+  --action "lambda:InvokeFunction" \
+  --principal events.amazonaws.com \
+  --source-arn "$RULE_ARN" \
+  --region "$AWS_REGION" 2>&1) || {
+    [[ "$ADD_PERM_OUTPUT" == *"ResourceConflictException"* ]] || { echo "$ADD_PERM_OUTPUT" >&2; exit 1; }
+  }
+aws events put-targets \
+  --rule "$SCHEDULE_RULE_NAME" \
+  --targets "Id=1,Arn=$FUNCTION_ARN" \
+  --region "$AWS_REGION" >/dev/null
+
 echo "Deployed $FUNCTION_NAME to $AWS_REGION"
