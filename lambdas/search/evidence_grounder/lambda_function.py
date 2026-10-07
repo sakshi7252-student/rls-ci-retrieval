@@ -83,12 +83,15 @@ _LOCAL_SCORE_TYPES = {"sentence", "paragraph", "table_row", "list_item"}
 
 # Specificity when several objects contain the same span: most specific first. A paragraph
 # that contains the span is only context once one of its sentences is the candidate.
+# table_row sorts ahead of table_cell (reversed from "most specific") so the dedup loop in
+# _objects_for_span visits the row first and keeps it over its own cells (see
+# _hierarchy_related) — the row's text is already the full pipe-joined line.
 _GROUND_TYPE_RANK = {
     "sentence":     0,
-    "table_cell":   1,
+    "table_row":    1,
     "list_item":    2,
     "paragraph":    3,
-    "table_row":    4,
+    "table_cell":   4,
     "table_header": 5,
     "heading":      6,
 }
@@ -274,13 +277,18 @@ def _retrieval_term_overlap(text: str, terms: list[str]) -> float:
 
 
 def _hierarchy_related(a: dict, b: dict) -> bool:
-    """True when one object is literally the other's container (sentence↔own paragraph).
-    Table cell/row pairs are NOT collapsed here — same table position but distinct object
-    types are kept as separate candidates and left to S6 llm_verify to judge independently."""
+    """True when one object is literally the other's container: sentence↔own paragraph
+    (via the _s\d+ object_id suffix), or a table_row ↔ one of its own table_cells (same
+    table_id+row_index) — the row's pipe-joined text already contains the cell's."""
     ida, idb = a.get("object_id"), b.get("object_id")
-    if not ida or not idb or ida == idb:
-        return False
-    return _parent_object_id(a) == idb or _parent_object_id(b) == ida
+    if ida and idb and ida != idb and (_parent_object_id(a) == idb or _parent_object_id(b) == ida):
+        return True
+    ta, tb = a.get("type"), b.get("type")
+    if {ta, tb} == {"table_row", "table_cell"}:
+        table_id, row_index = a.get("table_id"), a.get("row_index")
+        return (table_id is not None and table_id == b.get("table_id")
+                and isinstance(row_index, int) and row_index == b.get("row_index"))
+    return False
 
 
 def _objects_for_span(span_n: str, source: str, norm_pool: list[tuple[dict, str]]) -> tuple[list[dict], str, float] | None:
