@@ -13,13 +13,18 @@ task, DescribeTasks misreporting, etc.) the file stays PROCESSING forever
 with **no time-based safety net at all** in the cron itself. This Lambda
 adds that missing safety net, plus the same two watchdog alerts as the
 other two resources:
-  1. MISSED_STUCK: CLAIMED (no taskArn) well past the cron's own 10-minute
-     window (3x margin), OR PROCESSING for an implausibly long time (6h)
-     regardless of what ECS currently reports.
-  2. EXHAUSTED_RETRIES: attemptCount has hit the cap (3) and status is
+  1. CLAIMED_STUCK: CLAIMED well past the cron's own 10-minute window
+     (3x margin) when no taskArn was ever recorded, OR for an implausibly
+     long time (6h) when a taskArn is recorded but ECS still reports it
+     running.
+  2. PROCESSING_STUCK: PROCESSING with no forward progress (lastActivityAt)
+     for 2h, regardless of what ECS currently reports.
+  3. DISPATCHED_STUCK: DISPATCHED with no chunk callback activity
+     (dispatchedAt) for 1 day.
+  4. EXHAUSTED_RETRIES: attemptCount has hit the cap (3) and status is
      terminal-failed, so the recovery cron's own WHERE clause permanently
      excludes it.
-  3. NEVER_STARTED: extraction is done but indexingStatus is still PENDING/
+  5. NEVER_STARTED: extraction is done but indexingStatus is still PENDING/
      NULL well past the backfill cron's 1-minute cadence, meaning the
      initial dispatch never happened for this file.
 """
@@ -39,7 +44,7 @@ RESOURCE = "document-indexing"
 
 # attemptCount is derived (COUNT of file_indexing_attempts rows per file),
 # same as db.files.getFilesForDocumentIndexQuery's latestAttempt lateral join.
-MISSED_STUCK_SQL = """
+CLAIMED_STUCK_SQL = """
     SELECT
         f.id AS "fileId",
         f."indexingStatus",
@@ -68,6 +73,50 @@ MISSED_STUCK_SQL = """
           AND ia."lastActivityAt" < NOW() - INTERVAL '6 hours'
         )
       )
+"""
+
+# PROCESSING means chunks are actively being indexed (incrementDocumentIndexedChunk /
+# incrementDocumentFailedChunk bump lastActivityAt on each callback). No progress
+# in 2h means callbacks have stopped arriving entirely.
+PROCESSING_STUCK_SQL = """
+    SELECT
+        f.id AS "fileId",
+        f."indexingStatus",
+        ia."lastActivityAt",
+        (SELECT COUNT(*) FROM {schema}.file_indexing_attempts c WHERE c."fileId" = f.id) AS "attemptCount"
+    FROM {schema}.files f
+    LEFT JOIN LATERAL (
+        SELECT "lastActivityAt"
+        FROM {schema}.file_indexing_attempts ia
+        WHERE ia."fileId" = f.id
+        ORDER BY ia."startedAt" DESC NULLS LAST, ia.id DESC
+        LIMIT 1
+    ) ia ON true
+    WHERE f.deleted = false
+      AND f."indexingStatus" = 'PROCESSING'
+      AND ia."lastActivityAt" < NOW() - INTERVAL '2 hours'
+"""
+
+# DISPATCHED means dispatch to the chunk indexer completed but no chunk callback
+# has moved the attempt past it yet. No activity in 1 day means the chunks were
+# dropped somewhere downstream.
+DISPATCHED_STUCK_SQL = """
+    SELECT
+        f.id AS "fileId",
+        f."indexingStatus",
+        ia."dispatchedAt",
+        (SELECT COUNT(*) FROM {schema}.file_indexing_attempts c WHERE c."fileId" = f.id) AS "attemptCount"
+    FROM {schema}.files f
+    LEFT JOIN LATERAL (
+        SELECT "dispatchedAt"
+        FROM {schema}.file_indexing_attempts ia
+        WHERE ia."fileId" = f.id
+        ORDER BY ia."startedAt" DESC NULLS LAST, ia.id DESC
+        LIMIT 1
+    ) ia ON true
+    WHERE f.deleted = false
+      AND f."indexingStatus" = 'DISPATCHED'
+      AND ia."dispatchedAt" < NOW() - INTERVAL '1 day'
 """
 
 EXHAUSTED_SQL = """
@@ -104,7 +153,9 @@ def lambda_handler(event, context):
         resource=RESOURCE,
         required_table="file_indexing_attempts",
         queries={
-            "MISSED_STUCK": MISSED_STUCK_SQL,
+            "CLAIMED_STUCK": CLAIMED_STUCK_SQL,
+            "PROCESSING_STUCK": PROCESSING_STUCK_SQL,
+            "DISPATCHED_STUCK": DISPATCHED_STUCK_SQL,
             "EXHAUSTED_RETRIES": EXHAUSTED_SQL,
             "NEVER_STARTED": NEVER_STARTED_SQL,
         },

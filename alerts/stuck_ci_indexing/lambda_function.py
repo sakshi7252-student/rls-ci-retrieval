@@ -29,7 +29,7 @@ logger.setLevel(logging.INFO)
 RESOURCE = "ci-indexing"
 
 # 3x the cron's own 20-minute stuck window.
-MISSED_STUCK_SQL = """
+PROCESSING_STUCK_SQL = """
     SELECT "ciId", "indexName", "indexStatus", "attemptCount", "lastAttemptAt"
     FROM {schema}.ci_index_state
     WHERE "indexStatus" IN ('QUEUED', 'PROCESSING')
@@ -65,7 +65,7 @@ def lambda_handler(event, context):
         resource=RESOURCE,
         required_table="ci_index_state",
         queries={
-            "MISSED_STUCK": MISSED_STUCK_SQL,
+            "PROCESSING_STUCK": PROCESSING_STUCK_SQL,
             "EXHAUSTED_RETRIES": EXHAUSTED_SQL,
             "NEVER_STARTED": NEVER_STARTED_SQL,
         },
