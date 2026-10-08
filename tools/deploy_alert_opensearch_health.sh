@@ -76,6 +76,11 @@ done
 BUILD_DIR="$(mktemp -d)"
 trap 'rm -rf "$BUILD_DIR"' EXIT
 
+echo "Installing dependencies..."
+pip install --quiet --platform manylinux2014_x86_64 --target "$BUILD_DIR" \
+  --implementation cp --python-version 3.12 --only-binary=:all: \
+  -r "$ROOT_DIR/alerts/requirements.txt"
+
 echo "Packaging source..."
 cp -r "$ROOT_DIR/alerts/shared" "$BUILD_DIR/shared"
 cp "$ROOT_DIR/$ALERT_DIR"/*.py "$BUILD_DIR/"
