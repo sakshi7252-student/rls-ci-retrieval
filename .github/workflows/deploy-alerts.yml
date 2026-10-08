@@ -60,7 +60,7 @@ jobs:
           case "$DEPLOYMENT" in
             dev)
               AWS_REGION="eu-west-1"
-              ROLE_ARN="arn:aws:iam::064051750322:role/rls-document-extraction-lambda-execution-role"
+              ROLE_ARN="arn:aws:iam::064051750322:role/NLP_Error_Notification_role"
               DB_HOST="dev-rls.ceh23bpahliq.eu-west-1.rds.amazonaws.com"
               DB_NAME="rls_dev"
               DB_USER="rls"
