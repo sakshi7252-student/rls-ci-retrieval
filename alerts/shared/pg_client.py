@@ -83,3 +83,26 @@ def run_schema_query(connection, schema: str, query: str) -> list[dict]:
         except Exception:
             pass
         return []
+
+
+def get_main_account(connection, schema: str) -> dict:
+    """
+    Look up the main.accounts row for a tenant schema (e.g. to check
+    feature-access flags like accessToCIM before scanning that schema).
+    Returns {} if no row exists or the lookup fails.
+    """
+    try:
+        cursor = connection.cursor()
+        cursor.execute("SELECT * FROM main.accounts WHERE schema = %s", (schema,))
+        columns = [c[0] for c in cursor.description]
+        rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        cursor.close()
+        return rows[0] if rows else {}
+    except Exception as e:
+        logger.error(f"Error looking up main.accounts for schema {schema}: {str(e)}")
+        try:
+            connection.rollback()
+        except Exception:
+            pass
+        return {}
+

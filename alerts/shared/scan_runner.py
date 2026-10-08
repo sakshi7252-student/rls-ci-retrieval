@@ -9,7 +9,7 @@ instead of a raw stack trace.
 import time
 import logging
 
-from .pg_client import get_db_connection, get_all_schemas, check_table_exists, run_schema_query
+from .pg_client import get_db_connection, get_all_schemas, check_table_exists, run_schema_query, get_main_account
 from .sns_alert import send_sns_alert
 
 logger = logging.getLogger()
@@ -17,10 +17,18 @@ logger = logging.getLogger()
 MAX_SCHEMAS = 100
 
 
-def run_alert_scan(event, resource: str, required_table: str, queries: dict[str, str]) -> dict:
+def run_alert_scan(
+    event,
+    resource: str,
+    required_table: str,
+    queries: dict[str, str],
+    require_cim_access: bool = False,
+) -> dict:
     """
     queries: {"MISSED_STUCK": sql_template, "EXHAUSTED_RETRIES": sql_template, ...}
     Each sql_template must contain a `{schema}` placeholder for schema-qualification.
+    require_cim_access: when True, skip a schema whose main.accounts.accessToCIM
+    is not true, before any of the required_table/queries checks run.
     """
     start_time = time.monotonic()
     try:
@@ -39,6 +47,12 @@ def run_alert_scan(event, resource: str, required_table: str, queries: dict[str,
         totals = {alert_type: 0 for alert_type in queries}
 
         for schema in schemas:
+            if require_cim_access:
+                account = get_main_account(connection, schema)
+                if not account.get("accessToCIM"):
+                    logger.info(f"Schema {schema} has no CIM access, skipping")
+                    continue
+
             table_check_start = time.monotonic()
             exists = check_table_exists(connection, schema, required_table)
             logger.info(f"Table check for {schema} completed in {time.monotonic() - table_check_start:.2f}s")

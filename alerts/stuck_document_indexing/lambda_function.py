@@ -108,4 +108,5 @@ def lambda_handler(event, context):
             "EXHAUSTED_RETRIES": EXHAUSTED_SQL,
             "NEVER_STARTED": NEVER_STARTED_SQL,
         },
+        require_cim_access=True,
     )
