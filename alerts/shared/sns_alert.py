@@ -17,7 +17,6 @@ ENVIRONMENT = os.environ.get("ENVIRONMENT", "unknown")
 
 sns = boto3.client("sns")
 
-sent = False
 def send_sns_alert(rows: list[dict], alert_type: str, resource: str) -> None:
     """
     rows: each dict must include a "schema" key plus whatever identifying
@@ -26,14 +25,12 @@ def send_sns_alert(rows: list[dict], alert_type: str, resource: str) -> None:
     resource: short resource label, e.g. "file-extraction", "ci-indexing",
     "document-indexing".
     """
-    if not sent:
 
-        sns.publish(
-        TopicArn=SNS_TOPIC_ARN,
-        Message="TEST FROM LAMBDA - MMIS SNS DELIVERY",
-        Subject="Lambda SNS Test",
-        )
-        sent = True
+    sns.publish(
+    TopicArn=SNS_TOPIC_ARN,
+    Message="TEST FROM LAMBDA - MMIS SNS DELIVERY",
+    Subject="Lambda SNS Test",
+    )
     
     if not rows:
         return
