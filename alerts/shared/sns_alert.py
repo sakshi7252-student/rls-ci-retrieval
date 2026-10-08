@@ -26,21 +26,6 @@ def send_sns_alert(rows: list[dict], alert_type: str, resource: str) -> None:
     "document-indexing".
     """
 
-    try:
-        response = sns.publish(
-            TopicArn=SNS_TOPIC_ARN,
-            Message="TEST FROM LAMBDA - MMIS SNS DELIVERY",
-            Subject="Lambda SNS Test",
-        )
-
-        logger.info(
-            f"TEST SNS PUBLISH SUCCESS: "
-            f"topic={SNS_TOPIC_ARN}, "
-            f"message_id={response.get('MessageId')}"
-        )
-    except Exception:
-        logger.exception("TEST SNS PUBLISH FAILED")
-        raise
     if not rows:
         return
 
