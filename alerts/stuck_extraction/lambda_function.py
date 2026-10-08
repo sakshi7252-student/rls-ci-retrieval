@@ -10,7 +10,7 @@ and recover extraction failures on their own schedule:
 
 This Lambda is a watchdog, not a recovery path. It catches three things those
 crons cannot catch themselves:
-  1. MISSED_STUCK: a file is still stuck well past the cron's own window
+  1. STALLED: a file is still stuck well past the cron's own window
      (3x margin), meaning the cron missed it (crashed, deploy gap, DB down).
   2. EXHAUSTED_RETRIES: extractionFailedAttempt has hit the cap (3), so the
      retry cron's own WHERE clause permanently excludes it — a silent
@@ -34,7 +34,7 @@ logger.setLevel(logging.INFO)
 RESOURCE = "file-extraction"
 
 # 3x the cron's own stuck windows (EXTRACTING >1h, PENDING/QUEUED >30min).
-MISSED_STUCK_SQL = """
+STALLED_SQL = """
     SELECT id AS "fileId", "extractionStatus", "extractionUpdatedAt", "extractionFailedAttempt"
     FROM {schema}.files
     WHERE deleted = false
@@ -74,7 +74,7 @@ def lambda_handler(event, context):
         resource=RESOURCE,
         required_table="files",
         queries={
-            "MISSED_STUCK": MISSED_STUCK_SQL,
+            "STALLED": STALLED_SQL,
             "EXHAUSTED_RETRIES": EXHAUSTED_SQL,
             "NEVER_STARTED": NEVER_STARTED_SQL,
         },
