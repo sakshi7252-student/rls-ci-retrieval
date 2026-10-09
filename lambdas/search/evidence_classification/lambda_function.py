@@ -12,6 +12,14 @@ def _is_haiku_55(model: str) -> bool:
     return "claude-haiku-5" in model
 
 
+def _budget(model: str, base_tokens: int) -> int:
+    # Haiku 5.5's hidden thinking block eats into max_tokens before the real
+    # answer, so give it extra headroom instead of disabling thinking.
+    if _is_haiku_55(model):
+        return min(base_tokens, _MAX_OUT_TOKENS)
+    return base_tokens
+
+
 def _build_body_haiku_45(prompt: str, max_tokens: int) -> dict:
     """Haiku 4.5: single text block, deterministic via temperature=0."""
     return {
@@ -97,7 +105,7 @@ def _classify_evidence(ci_text: str, hit: dict, doc_ctx: dict) -> dict:
     try:
         import boto3 as _boto3
         br   = _boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
-        body = _build_body(VERIFIER_MODEL, prompt, _TOK_PER_CAND)
+        body = _build_body(VERIFIER_MODEL, prompt, _budget(VERIFIER_MODEL, _TOK_PER_CAND))
         resp      = br.invoke_model(
             modelId=VERIFIER_MODEL, contentType="application/json",
             accept="application/json", body=json.dumps(body).encode()
@@ -174,7 +182,7 @@ def _classify_evidence_batch(ci_text: str, hits: list[dict], doc_ctx: dict) -> l
         import boto3 as _boto3
         br   = _boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
         # 150 tokens/hit is the measured actual usage (was 100 — caused truncation)
-        body = _build_body(VERIFIER_MODEL, prompt, min(_TOK_PER_CAND * len(hits), _MAX_OUT_TOKENS))
+        body = _build_body(VERIFIER_MODEL, prompt, _budget(VERIFIER_MODEL, min(_TOK_PER_CAND * len(hits), _MAX_OUT_TOKENS)))
         resp      = br.invoke_model(modelId=VERIFIER_MODEL, contentType="application/json",
                                     accept="application/json", body=json.dumps(body).encode())
         resp_body = json.loads(resp["body"].read())

@@ -45,7 +45,6 @@ _MAX_WORKERS      = int(os.environ.get("MAX_VERIFY_WORKERS", "4"))  # parallelis
 _TOK_PER_CAND     = int(os.environ.get("VERIFY_TOKENS_PER_CAND", "250"))
 _MAX_OUT_TOKENS   = int(os.environ.get("VERIFY_MAX_OUT_TOKENS", "8000"))
 _USE_PREFILL      = os.environ.get("VERIFIER_PREFILL", "0") == "1"  # enable after confirming the model accepts it
-_TOK_ADD_ON = int(os.environ.get("VERIFY_TOKENS_ADD_ON", "200"))
 # Character budgets per excerpt part. <current> is what the retrievers matched,
 # so it gets the biggest budget; previous keeps its TAIL, next keeps its HEAD
 # (the text closest to <current>).
@@ -374,7 +373,7 @@ def _invoke(ci_text: str, header: str, cands: list[dict]) -> tuple[dict[int, dic
     if _is_haiku_55(BEDROCK_MODEL):
         # `temperature` is rejected and a hidden thinking block eats into max_tokens
         # before the JSON array, so give it extra budget instead.
-        body["max_tokens"] = min(body["max_tokens"] + _TOK_ADD_ON, _MAX_OUT_TOKENS)
+        body["max_tokens"] = min(body["max_tokens"], _MAX_OUT_TOKENS)
     else:
         body["temperature"] = 0
     resp = _get("bedrock-runtime", BEDROCK_REGION).invoke_model(
