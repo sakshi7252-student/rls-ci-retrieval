@@ -720,13 +720,13 @@ def _s9_evidence_classify(req: dict, skip_verify: bool = False) -> dict:
                 hit.update(ec_clean)
                 if _is_related(ec_clean["evidence_type"]):
                     hit["verdict"] = "MAYBE"
-                elif ec_clean["evidence_type"] == "UNRELATED":
+                # elif ec_clean["evidence_type"] == "UNRELATED":
                     # Deliberately allowed to override a disagreement-router MAYBE
                     # (see _apply_disagreement_router): this is a third, independent
                     # evidence signal, not a re-litigation of the same LLM verdict —
                     # a hard NO should require weak retrieval + LLM NO + no supporting
                     # downstream evidence, and UNRELATED here is exactly that absence.
-                    hit["verdict"] = "NO"
+                    # hit["verdict"] = "NO"
         hits.sort(key=lambda h: (
             _EVIDENCE_RANK.get(h.get("evidence_type", "BACKGROUND"), 4),
             -h.get("evidence_confidence", 0.0),
