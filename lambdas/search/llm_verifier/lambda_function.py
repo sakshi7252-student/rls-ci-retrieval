@@ -45,7 +45,7 @@ _MAX_WORKERS      = int(os.environ.get("MAX_VERIFY_WORKERS", "4"))  # parallelis
 _TOK_PER_CAND     = int(os.environ.get("VERIFY_TOKENS_PER_CAND", "250"))
 _MAX_OUT_TOKENS   = int(os.environ.get("VERIFY_MAX_OUT_TOKENS", "8000"))
 _USE_PREFILL      = os.environ.get("VERIFIER_PREFILL", "0") == "1"  # enable after confirming the model accepts it
-
+_TOK_ADD_ON = int(os.environ.get("VERIFY_TOKENS_ADD_ON", "200"))
 # Character budgets per excerpt part. <current> is what the retrievers matched,
 # so it gets the biggest budget; previous keeps its TAIL, next keeps its HEAD
 # (the text closest to <current>).
@@ -75,11 +75,16 @@ def _get(service: str, region: str | None = None):
 
 
 def _extract_text(resp_body: dict) -> str:
-    """First `text` content block — index 0 isn't always it (e.g. a thinking block first)."""
+    """First `text` content block — same call for every model, 4.5 just has one block
+    while 5.5 may prepend a `thinking` block ahead of it."""
     for block in resp_body.get("content", []):
         if block.get("type") == "text":
             return block.get("text", "")
     raise KeyError("no text block in response content")
+
+
+def _is_haiku_55(model: str) -> bool:
+    return "claude-haiku-5" in model
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -366,9 +371,11 @@ def _invoke(ci_text: str, header: str, cands: list[dict]) -> tuple[dict[int, dic
         "system": _SYSTEM,
         "messages": messages,
     }
-    # Haiku 5.5+ rejects `temperature` (replaced by an `effort` control) — only send it
-    # for models that still accept it.
-    if "claude-haiku-5" not in BEDROCK_MODEL:
+    if _is_haiku_55(BEDROCK_MODEL):
+        # `temperature` is rejected and a hidden thinking block eats into max_tokens
+        # before the JSON array, so give it extra budget instead.
+        body["max_tokens"] = min(body["max_tokens"] + _TOK_ADD_ON, _MAX_OUT_TOKENS)
+    else:
         body["temperature"] = 0
     resp = _get("bedrock-runtime", BEDROCK_REGION).invoke_model(
         modelId=BEDROCK_MODEL, contentType="application/json",

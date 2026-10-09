@@ -4,10 +4,42 @@ import json
 import logging
 
 EC_MAX_BATCH = int(os.environ.get("EC_MAX_BATCH", "30"))
+_TOK_PER_CAND = int(os.environ.get("VERIFY_TOKENS_PER_CAND", "200"))
+_MAX_OUT_TOKENS   = int(os.environ.get("VERIFY_MAX_OUT_TOKENS", "8000"))
+
+
+def _is_haiku_55(model: str) -> bool:
+    return "claude-haiku-5" in model
+
+
+def _build_body_haiku_45(prompt: str, max_tokens: int) -> dict:
+    """Haiku 4.5: single text block, deterministic via temperature=0."""
+    return {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+
+def _build_body_haiku_55(prompt: str, max_tokens: int) -> dict:
+    """Haiku 5.5: `temperature` is rejected, and a hidden thinking block eats into
+    max_tokens before the real answer — give it extra budget."""
+    return {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+
+def _build_body(model: str, prompt: str, max_tokens: int) -> dict:
+    return (_build_body_haiku_55(prompt, max_tokens) if _is_haiku_55(model)
+            else _build_body_haiku_45(prompt, max_tokens))
 
 
 def _extract_text(resp_body: dict) -> str:
-    """First `text` content block — index 0 isn't always it (e.g. a thinking block first)."""
+    """First `text` content block — same call for every model, 4.5 just has one block
+    while 5.5 may prepend a `thinking` block ahead of it."""
     for block in resp_body.get("content", []):
         if block.get("type") == "text":
             return block.get("text", "")
@@ -65,11 +97,7 @@ def _classify_evidence(ci_text: str, hit: dict, doc_ctx: dict) -> dict:
     try:
         import boto3 as _boto3
         br   = _boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
-        body = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 160,
-            "messages": [{"role": "user", "content": prompt}],
-        }
+        body = _build_body(VERIFIER_MODEL, prompt, _TOK_PER_CAND)
         resp      = br.invoke_model(
             modelId=VERIFIER_MODEL, contentType="application/json",
             accept="application/json", body=json.dumps(body).encode()
@@ -145,10 +173,8 @@ def _classify_evidence_batch(ci_text: str, hits: list[dict], doc_ctx: dict) -> l
     try:
         import boto3 as _boto3
         br   = _boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
-        body = {"anthropic_version": "bedrock-2023-05-31",
-                # 150 tokens/hit is the measured actual usage (was 100 — caused truncation)
-                "max_tokens": min(150 * len(hits), 8000),
-                "messages": [{"role": "user", "content": prompt}]}
+        # 150 tokens/hit is the measured actual usage (was 100 — caused truncation)
+        body = _build_body(VERIFIER_MODEL, prompt, min(_TOK_PER_CAND * len(hits), _MAX_OUT_TOKENS))
         resp      = br.invoke_model(modelId=VERIFIER_MODEL, contentType="application/json",
                                     accept="application/json", body=json.dumps(body).encode())
         resp_body = json.loads(resp["body"].read())
