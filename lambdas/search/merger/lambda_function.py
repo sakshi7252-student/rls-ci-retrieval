@@ -67,7 +67,8 @@ def _merge_group(ci_id, ci_text: str, group: list[dict]) -> dict:
         "text_search_pages": primary.get("text_search_pages") or [],
         "matched_object": matched_obj,
         "sources": sorted({s for c in ordered for s in c.get("sources", [])}),
-        "verdict": "YES" if any(c.get("verdict") == "YES" for c in ordered) else "MAYBE",
+        # group is always a single candidate now — pass its real verdict through, don't collapse NO into MAYBE.
+        "verdict": primary.get("verdict", "MAYBE"),
         "confidence": round(max(c.get("confidence", 0.0) for c in ordered), 3),
         "chunk_ids": chunk_ids,
         "retrieval_origin": primary.get("retrieval_origin", "direct_unknown"),
