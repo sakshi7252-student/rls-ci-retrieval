@@ -4,6 +4,14 @@ import json
 import logging
 
 EC_MAX_BATCH = int(os.environ.get("EC_MAX_BATCH", "30"))
+
+
+def _extract_text(resp_body: dict) -> str:
+    """First `text` content block — index 0 isn't always it (e.g. a thinking block first)."""
+    for block in resp_body.get("content", []):
+        if block.get("type") == "text":
+            return block.get("text", "")
+    raise KeyError("no text block in response content")
 AWS_REGION             = os.environ.get("AWS_REGION", "us-east-1")
 BEDROCK_REGION         = os.environ.get("BEDROCK_REGION", AWS_REGION)
 VERIFIER_MODEL         = os.environ.get("VERIFIER_MODEL",
@@ -56,7 +64,7 @@ def _classify_evidence(ci_text: str, hit: dict, doc_ctx: dict) -> dict:
     )
     try:
         import boto3 as _boto3
-        br   = _boto3.client("bedrock-runtime", region_name=AWS_REGION)
+        br   = _boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
         body = {
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": 160,
@@ -68,7 +76,7 @@ def _classify_evidence(ci_text: str, hit: dict, doc_ctx: dict) -> dict:
         )
         import re as _re
         resp_body    = json.loads(resp["body"].read())
-        text         = resp_body["content"][0]["text"].strip()
+        text         = _extract_text(resp_body).strip()
         ec_usage     = resp_body.get("usage", {})
         ec_in_tok    = ec_usage.get("input_tokens", 0)
         ec_out_tok   = ec_usage.get("output_tokens", 0)
@@ -136,7 +144,7 @@ def _classify_evidence_batch(ci_text: str, hits: list[dict], doc_ctx: dict) -> l
     )
     try:
         import boto3 as _boto3
-        br   = _boto3.client("bedrock-runtime", region_name=AWS_REGION)
+        br   = _boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
         body = {"anthropic_version": "bedrock-2023-05-31",
                 # 150 tokens/hit is the measured actual usage (was 100 — caused truncation)
                 "max_tokens": min(150 * len(hits), 8000),
@@ -144,7 +152,7 @@ def _classify_evidence_batch(ci_text: str, hits: list[dict], doc_ctx: dict) -> l
         resp      = br.invoke_model(modelId=VERIFIER_MODEL, contentType="application/json",
                                     accept="application/json", body=json.dumps(body).encode())
         resp_body = json.loads(resp["body"].read())
-        raw       = resp_body["content"][0]["text"].strip()
+        raw       = _extract_text(resp_body).strip()
         import re as _re
         raw = _re.sub(r"^```(?:json)?\s*", "", raw); raw = _re.sub(r"\s*```$", "", raw.strip())
         brace = raw.find("["); raw = raw[brace:] if brace >= 0 else raw

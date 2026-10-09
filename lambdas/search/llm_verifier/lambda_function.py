@@ -74,6 +74,14 @@ def _get(service: str, region: str | None = None):
     return _aws[key]
 
 
+def _extract_text(resp_body: dict) -> str:
+    """First `text` content block — index 0 isn't always it (e.g. a thinking block first)."""
+    for block in resp_body.get("content", []):
+        if block.get("type") == "text":
+            return block.get("text", "")
+    raise KeyError("no text block in response content")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Prompt
 # ─────────────────────────────────────────────────────────────────────────────
@@ -355,16 +363,19 @@ def _invoke(ci_text: str, header: str, cands: list[dict]) -> tuple[dict[int, dic
     body = {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": min(_TOK_PER_CAND * n + 100, _MAX_OUT_TOKENS),
-        "temperature": 0,
         "system": _SYSTEM,
         "messages": messages,
     }
+    # Haiku 5.5+ rejects `temperature` (replaced by an `effort` control) — only send it
+    # for models that still accept it.
+    if "claude-haiku-5" not in BEDROCK_MODEL:
+        body["temperature"] = 0
     resp = _get("bedrock-runtime", BEDROCK_REGION).invoke_model(
         modelId=BEDROCK_MODEL, contentType="application/json",
         accept="application/json", body=json.dumps(body).encode(),
     )
     resp_body = json.loads(resp["body"].read())
-    raw = resp_body["content"][0]["text"]
+    raw = _extract_text(resp_body)
     if _USE_PREFILL:
         raw = "[" + raw
     usage = resp_body.get("usage", {})
