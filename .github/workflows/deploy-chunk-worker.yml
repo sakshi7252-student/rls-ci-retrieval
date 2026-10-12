@@ -60,12 +60,16 @@ jobs:
       search_results_debug_bucket: ${{ steps.set.outputs.search_results_debug_bucket }}
       verifier_model:           ${{ steps.set.outputs.verifier_model }}
       results_debug_prefix:     ${{ steps.set.outputs.results_debug_prefix }}
+      verify_max_out_tokens:    ${{ steps.set.outputs.verify_max_out_tokens }}
+      verify_tokens_per_cand:   ${{ steps.set.outputs.verify_tokens_per_cand }}
     steps:
       - name: Set config for deployment
         id: set
         run: |
           DEPLOYMENT="${{ github.event.inputs.deployment || 'dev' }}"
           RESULTS_DEBUG_PREFIX="rls-ci-retrieval-search-results/debug"
+          VERIFY_MAX_OUT_TOKENS="64000"
+          VERIFY_TOKENS_PER_CAND="8000"
 
           case "$DEPLOYMENT" in
             dev)
@@ -135,6 +139,8 @@ jobs:
             echo "search_results_debug_bucket=$SEARCH_RESULTS_DEBUG_BUCKET"
             echo "verifier_model=$VERIFIER_MODEL"
             echo "results_debug_prefix=$RESULTS_DEBUG_PREFIX"
+            echo "verify_max_out_tokens=$VERIFY_MAX_OUT_TOKENS"
+            echo "verify_tokens_per_cand=$VERIFY_TOKENS_PER_CAND"
           } >> "$GITHUB_OUTPUT"
 
   changes:
@@ -291,6 +297,8 @@ jobs:
       SEARCH_RESULTS_DEBUG_BUCKET: ${{ needs.config.outputs.search_results_debug_bucket }}
       VERIFIER_MODEL:         ${{ needs.config.outputs.verifier_model }}
       RESULTS_DEBUG_PREFIX:   ${{ needs.config.outputs.results_debug_prefix }}
+      VERIFY_MAX_OUT_TOKENS:  ${{ needs.config.outputs.verify_max_out_tokens }}
+      VERIFY_TOKENS_PER_CAND: ${{ needs.config.outputs.verify_tokens_per_cand }}
 
     steps:
       - uses: actions/checkout@v4
