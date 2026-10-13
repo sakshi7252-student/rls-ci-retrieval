@@ -82,7 +82,7 @@ jobs:
               SEMANTIC_OBJECTS_INDEX="semantic-objects-v3"
               DOCUMENT_WORKER_REGIONS='["eu-west-1","us-east-1","us-west-2","eu-central-1","ap-south-1"]'
               SEARCH_RESULTS_DEBUG_BUCKET="rls-file-bucket-eu"
-              VERIFIER_MODEL="eu.anthropic.claude-haiku-4-5-20251001-v1:0"
+              VERIFIER_MODEL="eu.anthropic.claude-haiku-5-5"
               ;;
             qa)
               AWS_REGION="us-east-1"
@@ -94,7 +94,7 @@ jobs:
               SEMANTIC_OBJECTS_INDEX="semantic-objects-v3"
               DOCUMENT_WORKER_REGIONS='["us-east-1","us-west-2","us-east-2","eu-central-1","ap-south-1"]'
               SEARCH_RESULTS_DEBUG_BUCKET="rls-file-bucket-qa"
-              VERIFIER_MODEL="us.anthropic.claude-haiku-4-5-20251001-v1:0"
+              VERIFIER_MODEL="us.anthropic.claude-haiku-5-5"
               ;;
             cqa)
               AWS_REGION="eu-west-1"
@@ -106,7 +106,7 @@ jobs:
               SEMANTIC_OBJECTS_INDEX="semantic-objects-v3"
               DOCUMENT_WORKER_REGIONS='["eu-west-1"]'
               SEARCH_RESULTS_DEBUG_BUCKET="rls-file-bucket-cqa"
-              VERIFIER_MODEL="eu.anthropic.claude-haiku-4-5-20251001-v1:0"
+              VERIFIER_MODEL="eu.anthropic.claude-haiku-5-5"
               ;;
             prod)
               AWS_REGION="eu-west-1"
@@ -118,7 +118,7 @@ jobs:
               SEMANTIC_OBJECTS_INDEX="semantic-objects-v3"
               DOCUMENT_WORKER_REGIONS='["eu-west-1","us-east-1","us-west-2","eu-central-1","ap-south-1"]'
               SEARCH_RESULTS_DEBUG_BUCKET="rls-file-bucket-internal"
-              VERIFIER_MODEL="eu.anthropic.claude-haiku-4-5-20251001-v1:0"
+              VERIFIER_MODEL="eu.anthropic.claude-haiku-5-5"
               ;;
             *)
               echo "Unknown deployment: $DEPLOYMENT" >&2
