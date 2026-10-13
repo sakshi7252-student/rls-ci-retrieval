@@ -126,6 +126,11 @@ SEARCH_LATENCY_THRESHOLD_MS = float(os.environ.get("SEARCH_LATENCY_THRESHOLD_MS"
 SEARCH_LATENCY_SUSTAINED_MINUTES = int(os.environ.get("SEARCH_LATENCY_SUSTAINED_MINUTES", "3"))
 HTTP_4XX_SPIKE_THRESHOLD = int(os.environ.get("HTTP_4XX_SPIKE_THRESHOLD", "50"))
 
+# This Lambda runs on an hourly schedule -- cumulative-counter checks (e.g. ThreadpoolSearchRejected)
+# must span the full gap since the last run, not just the most recent minute, or a burst that
+# happened mid-hour and settled before the next invocation would never be seen.
+INVOCATION_INTERVAL_SECONDS = int(os.environ.get("INVOCATION_INTERVAL_SECONDS", "3600"))
+
 # AWS/ES metrics can take 1-3 minutes to be published to CloudWatch after the period closes.
 METRIC_INGESTION_LAG_SECONDS = int(os.environ.get("METRIC_INGESTION_LAG_SECONDS", "120"))
 
@@ -197,6 +202,17 @@ def _sustained_breach(values: list[float], threshold: float, min_periods: int) -
 
 def _latest_breach(values: list[float], threshold: float) -> bool:
     return bool(values) and values[-1] > threshold
+
+
+def _latest_delta_breach(values: list[float], threshold: float) -> bool:
+    """For metrics OpenSearch publishes as a lifetime-cumulative counter (e.g. ThreadpoolSearchRejected --
+    never resets until node restart), checking the raw value alone would fire forever after any
+    historical burst. Compares the oldest vs newest datapoint across the whole queried window (which
+    should span the full gap since the last invocation) and only breaches on NEW activity (positive delta).
+    """
+    if len(values) < 2:
+        return False
+    return (values[-1] - values[0]) > threshold
 
 
 def _check_data_presence(check_fn, metric_name: str, values: list, expected_periods: int) -> None:
@@ -376,9 +392,11 @@ def lambda_handler(event, context):
         if _latest_breach(search_queue, THREADPOOL_SEARCH_QUEUE_THRESHOLD):
             check("THREADPOOL_PRESSURE", {"metric": "ThreadpoolSearchQueue", "value": search_queue[-1], "threshold": THREADPOOL_SEARCH_QUEUE_THRESHOLD, "severity": "P2"})
         for metric_name in ("ThreadpoolWriteRejected", "ThreadpoolSearchRejected"):
-            values = _get_datapoints(account_id, metric_name, "Sum", 60, 60)
-            if _latest_breach(values, 0):
-                check("THREADPOOL_PRESSURE", {"metric": metric_name, "value": values[-1], "severity": "P1"})
+            # OpenSearch publishes these as a lifetime-cumulative count, not a per-period delta --
+            # span the full gap since the last run so a mid-interval burst isn't missed.
+            values = _get_datapoints(account_id, metric_name, "Sum", 60, INVOCATION_INTERVAL_SECONDS)
+            if _latest_delta_breach(values, 0):
+                check("THREADPOOL_PRESSURE", {"metric": metric_name, "value": values[-1], "new_rejections": values[-1] - values[0], "severity": "P1"})
 
         # 14. Automated snapshot failure.
         snap_start = time.monotonic()
