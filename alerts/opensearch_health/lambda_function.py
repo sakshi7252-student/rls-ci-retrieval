@@ -126,6 +126,9 @@ SEARCH_LATENCY_THRESHOLD_MS = float(os.environ.get("SEARCH_LATENCY_THRESHOLD_MS"
 SEARCH_LATENCY_SUSTAINED_MINUTES = int(os.environ.get("SEARCH_LATENCY_SUSTAINED_MINUTES", "3"))
 HTTP_4XX_SPIKE_THRESHOLD = int(os.environ.get("HTTP_4XX_SPIKE_THRESHOLD", "50"))
 
+# AWS/ES metrics can take 1-3 minutes to be published to CloudWatch after the period closes.
+METRIC_INGESTION_LAG_SECONDS = int(os.environ.get("METRIC_INGESTION_LAG_SECONDS", "120"))
+
 OPENSEARCH_ENDPOINT = os.environ.get("OPENSEARCH_ENDPOINT")
 OPEN_SEARCH_REGION  = os.environ.get("OPEN_SEARCH_REGION", os.environ.get("AWS_REGION", "eu-west-1"))
 CRITICAL_INDICES = [s.strip() for s in os.environ.get(
@@ -162,8 +165,13 @@ sts = boto3.client("sts")
 
 
 def _get_datapoints(account_id: str, metric_name: str, statistic: str, period_seconds: int, lookback_seconds: int):
-    """Returns datapoint values ordered oldest-to-newest for the lookback window."""
-    now = int(time.time())
+    """Returns datapoint values ordered oldest-to-newest for the lookback window.
+
+    EndTime is offset back by METRIC_INGESTION_LAG_SECONDS because AWS/ES metrics
+    can take 1-3 minutes to land in CloudWatch -- querying right up to "now"
+    routinely misses the freshest datapoint(s) and falsely trips MONITORING_DATA_MISSING.
+    """
+    now = int(time.time()) - METRIC_INGESTION_LAG_SECONDS
     response = cloudwatch.get_metric_statistics(
         Namespace="AWS/ES",
         MetricName=metric_name,
@@ -340,13 +348,13 @@ def lambda_handler(event, context):
         native_start = time.monotonic()
         native_values = _get_datapoints(account_id, "NativeMemoryPressure", "Maximum", 60, NATIVE_MEMORY_SUSTAINED_MINUTES * 60)
         logger.info(f"NativeMemoryPressure check completed in {time.monotonic() - native_start:.2f}s ({len(native_values)} datapoints)")
-        # _check_data_presence(check, "NativeMemoryPressure", native_values, NATIVE_MEMORY_SUSTAINED_MINUTES)
-        # if _sustained_breach(native_values, NATIVE_MEMORY_PRESSURE_THRESHOLD, NATIVE_MEMORY_SUSTAINED_MINUTES):
-        #     check("NATIVE_MEMORY_PRESSURE", {
-        #         "metric": "NativeMemoryPressure", "threshold": NATIVE_MEMORY_PRESSURE_THRESHOLD,
-        #         "sustained_minutes": NATIVE_MEMORY_SUSTAINED_MINUTES,
-        #         "recent_values": native_values[-NATIVE_MEMORY_SUSTAINED_MINUTES:], "severity": "P1",
-        #     })
+        _check_data_presence(check, "NativeMemoryPressure", native_values, NATIVE_MEMORY_SUSTAINED_MINUTES)
+        if _sustained_breach(native_values, NATIVE_MEMORY_PRESSURE_THRESHOLD, NATIVE_MEMORY_SUSTAINED_MINUTES):
+            check("NATIVE_MEMORY_PRESSURE", {
+                "metric": "NativeMemoryPressure", "threshold": NATIVE_MEMORY_PRESSURE_THRESHOLD,
+                "sustained_minutes": NATIVE_MEMORY_SUSTAINED_MINUTES,
+                "recent_values": native_values[-NATIVE_MEMORY_SUSTAINED_MINUTES:], "severity": "P1",
+            })
 
         # 12. Write rejections (indexing pressure).
         for metric_name in ("CoordinatingWriteRejected", "PrimaryWriteRejected", "ReplicaWriteRejected"):
