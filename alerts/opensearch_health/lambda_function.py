@@ -348,7 +348,9 @@ def lambda_handler(event, context):
         native_start = time.monotonic()
         native_values = _get_datapoints(account_id, "NativeMemoryPressure", "Maximum", 60, NATIVE_MEMORY_SUSTAINED_MINUTES * 60)
         logger.info(f"NativeMemoryPressure check completed in {time.monotonic() - native_start:.2f}s ({len(native_values)} datapoints)")
-        _check_data_presence(check, "NativeMemoryPressure", native_values, NATIVE_MEMORY_SUSTAINED_MINUTES)
+        # Not a data-presence check: rls-dev never publishes this metric at all (confirmed 0
+        # datapoints over 6h via direct CloudWatch query) -- would fire MONITORING_DATA_MISSING
+        # on every single invocation, which is pure noise, not a real gap.
         if _sustained_breach(native_values, NATIVE_MEMORY_PRESSURE_THRESHOLD, NATIVE_MEMORY_SUSTAINED_MINUTES):
             check("NATIVE_MEMORY_PRESSURE", {
                 "metric": "NativeMemoryPressure", "threshold": NATIVE_MEMORY_PRESSURE_THRESHOLD,
