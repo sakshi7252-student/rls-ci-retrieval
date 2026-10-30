@@ -157,7 +157,7 @@ def lambda_handler(event, context):
             "PROCESSING_STUCK": PROCESSING_STUCK_SQL,
             "DISPATCHED_STUCK": DISPATCHED_STUCK_SQL,
             "EXHAUSTED_RETRIES": EXHAUSTED_SQL,
-            "NEVER_STARTED": NEVER_STARTED_SQL,
+            # "NEVER_STARTED": NEVER_STARTED_SQL,
         },
         require_cim_access=True,
     )
