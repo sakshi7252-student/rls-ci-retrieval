@@ -113,15 +113,33 @@ def _longest_common_span(needle_lower: str, haystack_lower: str):
     return matcher.find_longest_match(0, len(needle_lower), 0, len(haystack_lower))
 
 
+# find_longest_match only ever returns ONE match — to catch the same fuzzy/decorated
+# phrase repeating in the same chunk, blank out each found span in the haystack and
+# re-search, so a second (or third) occurrence doesn't just get silently missed.
+# Bounded by max_matches since each pass re-runs SequenceMatcher from scratch.
+def _longest_common_spans_all(needle_lower: str, haystack_lower: str, min_len: int, max_matches: int = 5) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    working = haystack_lower
+    for _ in range(max_matches):
+        span = _longest_common_span(needle_lower, working)
+        if span.size < min_len:
+            break
+        spans.append((span.b, span.size))
+        working = working[:span.b] + ("\x00" * span.size) + working[span.b + span.size:]
+    return spans
+
+
 # Spacing/wrapping punctuation varies a lot between how a CI is authored and
 # how the source document renders it ("n=62" vs "n = 62" vs "(N = 62)") even
 # though the content is identical. Compare with whitespace and wrapping
 # punctuation removed so this never has to fall through to the weaker
 # fuzzy/partial strategies just because of formatting, then map the found
 # span back to real raw_text offsets (including whatever original formatting
-# raw_text had there).
+# raw_text had there). Hyphen is included too ("PO-weekly" vs "PO weekly") —
+# without it this case falls through to Strategy 2, which can only return the
+# longest EXACT common run and silently truncates to "weekly" alone.
 def _is_ignorable_format_char(ch: str) -> bool:
-    return ch.isspace() or ch in '()[]{}'
+    return ch.isspace() or ch in '()[]{}-'
 
 
 def _find_ignoring_whitespace(
@@ -147,6 +165,38 @@ def _find_ignoring_whitespace(
     start = index_map[idx]
     end = index_map[idx + len(compact_needle) - 1] + 1
     return start, end
+
+
+# Same as _find_ignoring_whitespace but returns EVERY non-overlapping occurrence —
+# the same CI phrase can legitimately appear more than once in one chunk (e.g. a
+# repeated heading/table value across sentences), and grounding needs a span for
+# each occurrence, not just the first.
+def _find_all_ignoring_whitespace(
+    needle_lower: str,
+    haystack_lower: str,
+    haystack_index_map: list[int] | None = None,
+) -> list[tuple[int, int]]:
+    if haystack_index_map is None:
+        haystack_index_map = list(range(len(haystack_lower)))
+    compact_chars: list[str] = []
+    index_map: list[int] = []
+    for i, ch in enumerate(haystack_lower):
+        if not _is_ignorable_format_char(ch):
+            compact_chars.append(ch)
+            index_map.append(haystack_index_map[i])
+    compact_haystack = ''.join(compact_chars)
+    compact_needle = ''.join(ch for ch in needle_lower if not _is_ignorable_format_char(ch))
+    if not compact_needle:
+        return []
+    spans: list[tuple[int, int]] = []
+    search_from = 0
+    while True:
+        idx = compact_haystack.find(compact_needle, search_from)
+        if idx < 0:
+            break
+        spans.append((index_map[idx], index_map[idx + len(compact_needle) - 1] + 1))
+        search_from = idx + max(len(compact_needle), 1)
+    return spans
 
 
 # Every strategy locates a match as a (start, size) pair in raw_lower's own
@@ -230,59 +280,83 @@ def _extract_literal_matches(ci_text: str, raw_text: str) -> list[dict]:
     ci_s = _fold_dashes(_fold_quotes(unicodedata.normalize('NFC', ci_text.strip())))
     ci_lower = ci_s.lower()
 
-    # Strategy 1 — whole phrase, exact substring
-    idx  = raw_lower.find(ci_lower)
-    if idx >= 0:
+    # Strategy 1 — whole phrase, exact substring — ALL occurrences, not just the
+    # first: the same CI text can legitimately appear twice in one chunk (e.g. a
+    # repeated value across two sentences), and each occurrence needs its own span
+    # so evidence_grounder can ground every object that actually contains it.
+    search_from = 0
+    while True:
+        idx = raw_lower.find(ci_lower, search_from)
+        if idx < 0:
+            break
         start, end = _map_span(raw_index_map, idx, len(ci_lower))
-        return [{"text": raw_text[start:end], "start": start, "end": end, "match_id": f"literal_{start}_{end}"}]
+        matches.append({"text": raw_text[start:end], "start": start, "end": end, "match_id": f"literal_{start}_{end}"})
+        search_from = idx + max(len(ci_lower), 1)
 
     # Strategy 1b — whole phrase, exact match but ignoring whitespace
-    # differences ("n=62" vs "n = 62") and wrapping punctuation.
-    span_ws = _find_ignoring_whitespace(ci_lower, raw_lower, raw_index_map)
-    if span_ws is not None:
-        start, end = span_ws
-        return [{"text": raw_text[start:end], "start": start, "end": end, "match_id": f"literal_{start}_{end}"}]
+    # differences ("n=62" vs "n = 62") and wrapping punctuation — run even when
+    # Strategy 1 already found matches, since one occurrence can be plain-exact
+    # while ANOTHER occurrence of the same phrase elsewhere is only formatting-
+    # different; starts are deduped below so an exact hit isn't double-counted.
+    seen_starts = {m["start"] for m in matches}
+    for start, end in _find_all_ignoring_whitespace(ci_lower, raw_lower, raw_index_map):
+        if start not in seen_starts:
+            matches.append({"text": raw_text[start:end], "start": start, "end": end, "match_id": f"literal_{start}_{end}"})
+            seen_starts.add(start)
 
     # Strategy 2 — whole phrase, longest common substring. Absorbs any kind of
     # decoration mismatch (markers, quotes, labels, punctuation, initials...)
     # without needing to enumerate what the decoration looks like, and also
     # surfaces a genuine partial match when only part of ci_text is present.
-    span = _longest_common_span(ci_lower, raw_lower)
+    # Always runs (not just when 1/1b found nothing) — one occurrence can be a
+    # plain/formatting match while another elsewhere is decorated differently
+    # enough that only fuzzy matching catches it.
     min_len = max(_MIN_PARTIAL_CHARS, int(len(ci_lower) * _MIN_PARTIAL_RATIO))
-    if span.size >= min_len:
-        start, end = _map_span(raw_index_map, span.b, span.size)
+    for b_start, size in _longest_common_spans_all(ci_lower, raw_lower, min_len):
+        start, end = _map_span(raw_index_map, b_start, size)
         matches.append({"text": raw_text[start:end], "start": start, "end": end, "match_id": f"literal_{start}_{end}"})
 
     # Strategy 3 — significant sub-phrases, exact then fuzzy. Only meaningful
     # when ci_text actually splits into more than one clause — a single-clause
     # ci_text would just re-run Strategy 2 against the identical whole string.
+    # Each clause can also repeat, so every occurrence is collected here too.
     sub_phrases = [p.strip() for p in re.split(r'[,;\n]+', ci_s) if len(p.strip()) >= 5]
     if len(sub_phrases) > 1:
         for phrase in sub_phrases:
             phrase_lower = phrase.lower()
-            idx = raw_lower.find(phrase_lower)
-            if idx >= 0:
+            phrase_search_from = 0
+            found_exact = False
+            while True:
+                idx = raw_lower.find(phrase_lower, phrase_search_from)
+                if idx < 0:
+                    break
                 start, end = _map_span(raw_index_map, idx, len(phrase_lower))
                 matches.append({"text": raw_text[start:end], "start": start, "end": end, "match_id": f"literal_{start}_{end}"})
+                phrase_search_from = idx + max(len(phrase_lower), 1)
+                found_exact = True
+            if found_exact:
                 continue
-            span_ws = _find_ignoring_whitespace(phrase_lower, raw_lower, raw_index_map)
-            if span_ws is not None:
-                start, end = span_ws
-                matches.append({"text": raw_text[start:end], "start": start, "end": end, "match_id": f"literal_{start}_{end}"})
+            spans_ws = _find_all_ignoring_whitespace(phrase_lower, raw_lower, raw_index_map)
+            if spans_ws:
+                for start, end in spans_ws:
+                    matches.append({"text": raw_text[start:end], "start": start, "end": end, "match_id": f"literal_{start}_{end}"})
                 continue
-            span = _longest_common_span(phrase_lower, raw_lower)
             min_len = max(_MIN_PARTIAL_CHARS, int(len(phrase_lower) * _MIN_PARTIAL_RATIO))
-            if span.size >= min_len:
-                start, end = _map_span(raw_index_map, span.b, span.size)
+            for b_start, size in _longest_common_spans_all(phrase_lower, raw_lower, min_len):
+                start, end = _map_span(raw_index_map, b_start, size)
                 matches.append({"text": raw_text[start:end], "start": start, "end": end, "match_id": f"literal_{start}_{end}"})
 
-    # Deduplicate overlapping spans, keep leftmost
-    seen: set[int] = set()
+    # Dedupe: with multiple strategies now all additive, a weaker/partial span can
+    # land fully inside a stronger span already found for the same occurrence
+    # (e.g. Strategy 2's fuzzy partial overlapping an exact/1b hit) — keep the
+    # longest span per region, drop any span fully contained in one already kept.
+    ordered = sorted(matches, key=lambda x: (x["start"], -(x["end"] - x["start"])))
     unique: list[dict] = []
-    for m in sorted(matches, key=lambda x: x["start"]):
-        if m["start"] not in seen:
-            seen.add(m["start"])
-            unique.append(m)
+    for m in ordered:
+        if any(k["start"] <= m["start"] and m["end"] <= k["end"] for k in unique):
+            continue
+        unique.append(m)
+    unique.sort(key=lambda x: x["start"])
     return unique
 
 
