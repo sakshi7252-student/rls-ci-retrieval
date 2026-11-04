@@ -1205,10 +1205,25 @@ def _indexed_object(v: dict) -> dict | None:
         # NER
         "entities":           obj.get("entities", []),
         # Clinical fact extraction
+        "object_subtype":     obj.get("object_subtype"),
+        "modality":           obj.get("modality"),
         "facts":              obj.get("facts", {}),
+        "own_facts":          obj.get("own_facts", {}),
+        "effective_facts":    obj.get("effective_facts", {}),
+        "inherited_slots":    obj.get("inherited_slots", []),
+        "slot_provenance":    obj.get("slot_provenance", {}),
         "statement_type":     obj.get("statement_type"),
         "study_context":      obj.get("study_context"),
+        "study_hierarchy":    obj.get("study_hierarchy", {}),
+        "clinical_identity":  obj.get("clinical_identity", {}),
         "clinical_relations": obj.get("clinical_relations", []),
+        "negated_slots":      obj.get("negated_slots", []),
+        "treatment_identity":  obj.get("treatment_identity", {}),
+        "endpoint_identity":   obj.get("endpoint_identity", {}),
+        "population_identity": obj.get("population_identity", {}),
+        "temporal_context":    obj.get("temporal_context", {}),
+        "clinical_signature":  obj.get("clinical_signature", {}),
+        "statistical_identity": obj.get("statistical_identity", {}),
     }
 
 
@@ -1246,6 +1261,9 @@ def _ci_metadata(ci: dict) -> dict:
         "ci_type":              cls.get("ci_type"),
         "strategies":           cls.get("strategies", []),
         "classification_reason": cls.get("reason"),
+        "object_subtype":       ci.get("object_subtype"),
+        "clinical_signature":   ci.get("clinical_signature", {}),
+        "statistical_identity": ci.get("statistical_identity", {}),
         # ── Clinical facts ────────────────────────────────────────────────────
         "facts":                ci.get("facts", {}),
         "own_facts":            ci.get("own_facts", {}),
@@ -1373,11 +1391,25 @@ def _full_candidate_record(v: dict) -> dict:
             # ── NER ───────────────────────────────────────────────────────
             "entities":           obj.get("entities", []),
             # ── Clinical facts ────────────────────────────────────────────
+            "object_subtype":     obj.get("object_subtype"),
+            "modality":           obj.get("modality"),
             "facts":              obj.get("facts", {}),
-            "effective_facts":    obj.get("effective_facts"),
+            "own_facts":          obj.get("own_facts", {}),
+            "effective_facts":    obj.get("effective_facts", {}),
+            "inherited_slots":    obj.get("inherited_slots", []),
+            "slot_provenance":    obj.get("slot_provenance", {}),
             "statement_type":     obj.get("statement_type"),
             "study_context":      obj.get("study_context"),
+            "study_hierarchy":    obj.get("study_hierarchy", {}),
+            "clinical_identity":  obj.get("clinical_identity", {}),
             "clinical_relations": obj.get("clinical_relations", []),
+            "negated_slots":      obj.get("negated_slots", []),
+            "treatment_identity":  obj.get("treatment_identity", {}),
+            "endpoint_identity":   obj.get("endpoint_identity", {}),
+            "population_identity": obj.get("population_identity", {}),
+            "temporal_context":    obj.get("temporal_context", {}),
+            "clinical_signature":  obj.get("clinical_signature", {}),
+            "statistical_identity": obj.get("statistical_identity", {}),
         },
     }
 
