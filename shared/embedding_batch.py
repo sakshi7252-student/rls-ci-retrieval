@@ -120,7 +120,11 @@ def submit_batch_job(
     Raises InsufficientRecordsError (before any S3 write or Bedrock call) if
     there are embeddable records but fewer than Bedrock's MIN_BATCH_RECORDS.
     """
+    timings: dict[str, float] = {}
+
+    t0 = time.perf_counter()
     manifest_bytes, mapping = build_manifest(chunks, embedding_mod)
+    timings["build_manifest"] = round(time.perf_counter() - t0, 3)
     if not mapping:
         logger.info("[EmbeddingBatch] nothing to embed for job_submission_id=%s (skipped)", job_submission_id)
         return None
@@ -133,6 +137,7 @@ def submit_batch_job(
     chunks_prefix = f"{base}/chunks"
     output_prefix = f"{base}/output/"
 
+    t0 = time.perf_counter()
     s3_client.put_object(Bucket=payload_bucket, Key=manifest_key, Body=manifest_bytes)
     s3_client.put_object(
         Bucket=payload_bucket, Key=mapping_key,
@@ -147,7 +152,9 @@ def submit_batch_job(
             Bucket=payload_bucket, Key=f"{chunks_prefix}/{chunk_id}.json",
             Body=json.dumps(chunk, separators=(",", ":")).encode("utf-8"),
         )
+    timings["s3_upload"] = round(time.perf_counter() - t0, 3)
 
+    t0 = time.perf_counter()
     job_name = f"doc-embed-{job_submission_id}"[:63]
     response = bedrock_client.create_model_invocation_job(
         jobName=job_name,
@@ -156,6 +163,7 @@ def submit_batch_job(
         inputDataConfig={"s3InputDataConfig": {"s3Uri": f"s3://{payload_bucket}/{manifest_key}"}},
         outputDataConfig={"s3OutputDataConfig": {"s3Uri": f"s3://{payload_bucket}/{output_prefix}"}},
     )
+    timings["create_job"] = round(time.perf_counter() - t0, 3)
     job_arn = response["jobArn"]
 
     job_record = {
@@ -176,8 +184,10 @@ def submit_batch_job(
     )
 
     logger.info(
-        "[EmbeddingBatch] submitted job_arn=%s chunks=%d records=%d job_submission_id=%s",
+        "[EmbeddingBatch] submitted job_arn=%s chunks=%d records=%d job_submission_id=%s "
+        "build_manifest=%.3fs s3_upload=%.3fs create_job=%.3fs",
         job_arn, len(chunk_ids), len(mapping), job_submission_id,
+        timings["build_manifest"], timings["s3_upload"], timings["create_job"],
     )
     return job_record
 

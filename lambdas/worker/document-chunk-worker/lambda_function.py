@@ -194,13 +194,36 @@ def _prepare_chunk_for_batch(chunk: dict, context: Any = None) -> dict:
     ner = _load("ner", "ner")
     ontology = _load("ontology", "ontology")
 
-    t0 = time.perf_counter()
-    chunk = normalize._process_document(chunk)
-    chunk = ner._process_document(chunk)
-    chunk = ontology._process_document(chunk)
-    logger.info(
-        "[ChunkWorker] prepared chunk_id=%s elapsed_s=%.3f",
-        chunk.get("chunk_id"), time.perf_counter() - t0,
+    timings: dict[str, float] = {}
+    t_total = time.perf_counter()
+
+    def _timed(label: str, fn, *args, **kwargs):
+        t = time.perf_counter()
+        result = fn(*args, **kwargs)
+        timings[label] = round(time.perf_counter() - t, 3)
+        return result
+
+    chunk = _timed("normalize", normalize._process_document, chunk)
+    chunk = _timed("ner",       ner._process_document,       chunk)
+    chunk = _timed("ontology",  ontology._process_document,  chunk)
+
+    elapsed = round(time.perf_counter() - t_total, 3)
+    extraction = chunk.get("extraction", {})
+    obj_list = extraction.get("objects", [])
+    pages = chunk.get("page_end", 0) - chunk.get("page_start", 0) + 1
+
+    _rss_raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    import platform
+    rss_mb = round(_rss_raw / 1024 if platform.system() != "Darwin" else _rss_raw / 1_048_576, 1)
+
+    _SLOW_CHUNK_THRESHOLD_S = 300
+    log_fn = logger.warning if elapsed > _SLOW_CHUNK_THRESHOLD_S else logger.info
+    log_fn(
+        "[ChunkWorker] prepared chunk_id=%s pages=%d objects=%d rss_mb=%.1f "
+        "normalize=%.3fs ner=%.3fs ontology=%.3fs elapsed_s=%.3f%s",
+        chunk.get("chunk_id"), pages, len(obj_list), rss_mb,
+        timings.get("normalize", 0), timings.get("ner", 0), timings.get("ontology", 0),
+        elapsed, " [SLOW]" if elapsed > _SLOW_CHUNK_THRESHOLD_S else "",
     )
     return chunk
 
@@ -214,7 +237,8 @@ def _submit_embedding_batch(chunks: list[dict], context: Any = None) -> dict | N
     embedding = _load(*_EMBEDDING_MODULE)
     job_submission_id = getattr(context, "aws_request_id", "") or uuid.uuid4().hex
 
-    return embedding_batch.submit_batch_job(
+    t0 = time.perf_counter()
+    job_record = embedding_batch.submit_batch_job(
         bedrock_client=_get("bedrock"),
         s3_client=_get("s3"),
         payload_bucket=EMBEDDING_BATCH_PAYLOAD_BUCKET,
@@ -225,6 +249,11 @@ def _submit_embedding_batch(chunks: list[dict], context: Any = None) -> dict | N
         chunks=chunks,
         embedding_mod=embedding,
     )
+    logger.info(
+        "[ChunkWorker] submit_embedding_batch chunks=%d elapsed_s=%.3f job_submission_id=%s",
+        len(chunks), time.perf_counter() - t0, job_submission_id,
+    )
+    return job_record
 
 
 def _get_attempt_id(chunk: dict) -> str | None:
@@ -442,6 +471,7 @@ def _handle_batch_sqs_invoke(event: dict, context: Any) -> dict:
     failures: list[dict[str, str]] = []
     processed = 0
     prepared: list[tuple[str, dict]] = []
+    t_prepare_total = time.perf_counter()
 
     for record in event.get("Records", []):
         message_id = record.get("messageId", "")
@@ -479,9 +509,19 @@ def _handle_batch_sqs_invoke(event: dict, context: Any) -> dict:
             if message_id:
                 failures.append({"itemIdentifier": message_id})
 
+    logger.info(
+        "[ChunkWorker] batch prepare_total_s=%.3f records=%d prepared=%d failed=%d",
+        time.perf_counter() - t_prepare_total, len(event.get("Records", [])), len(prepared), len(failures),
+    )
+
     if prepared:
+        t_submit_total = time.perf_counter()
         try:
             _submit_embedding_batch([c for _, c in prepared], context)
+            logger.info(
+                "[ChunkWorker] batch submit_total_s=%.3f chunks=%d",
+                time.perf_counter() - t_submit_total, len(prepared),
+            )
         except embedding_batch.InsufficientRecordsError as exc:
             # Too few embeddable records for a Bedrock batch job (e.g. a
             # trailing partial batch at the end of a document). Rather than
