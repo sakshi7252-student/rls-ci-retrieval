@@ -482,6 +482,30 @@ def _handle_batch_sqs_invoke(event: dict, context: Any) -> dict:
     if prepared:
         try:
             _submit_embedding_batch([c for _, c in prepared], context)
+        except embedding_batch.InsufficientRecordsError as exc:
+            # Too few embeddable records for a Bedrock batch job (e.g. a
+            # trailing partial batch at the end of a document). Rather than
+            # looping on the same failure until DLQ, embed these synchronously.
+            logger.warning(
+                "[ChunkWorker] %s for %d chunks — falling back to synchronous embedding",
+                exc, len(prepared),
+            )
+            embedding = _load(*_EMBEDDING_MODULE)
+            idx = _load("index", "idx")
+            for message_id, chunk in prepared:
+                try:
+                    chunk = embedding._process_document(chunk, lambda_ctx=context)
+                    idx._process_document(chunk)
+                    _notify_indexed(chunk, {"chunk_id": chunk.get("chunk_id")})
+                except Exception as chunk_exc:
+                    logger.exception(
+                        "[ChunkWorker] synchronous embedding fallback failed message_id=%s chunk_id=%s error=%s",
+                        message_id, chunk.get("chunk_id", "?"), chunk_exc,
+                    )
+                    _notify_failed(chunk, chunk_exc)
+                    if message_id:
+                        failures.append({"itemIdentifier": message_id})
+                    processed -= 1
         except Exception as exc:
             # Submission is all-or-nothing for this invocation's batch: if the
             # Bedrock job never got submitted, none of these chunks were handed

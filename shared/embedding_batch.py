@@ -27,6 +27,22 @@ logger = logging.getLogger(__name__)
 
 JOBS_PREFIX = "embedding-batch/jobs"
 
+# Bedrock rejects batch-inference jobs with fewer than this many records
+# (e.g. "contains less records (1) than the required minimum of: 100").
+MIN_BATCH_RECORDS = 100
+
+
+class InsufficientRecordsError(Exception):
+    """Raised when a candidate batch has fewer embeddable records than Bedrock's
+    minimum, so the job was never submitted — caller should fall back to
+    synchronous (on-demand) embedding for these chunks instead of retrying."""
+
+    def __init__(self, record_count: int):
+        self.record_count = record_count
+        super().__init__(
+            f"only {record_count} embeddable records, below Bedrock's minimum of {MIN_BATCH_RECORDS}"
+        )
+
 
 def _embeddable_texts(chunk: dict, embedding_mod: Any) -> list[dict]:
     """Every text in this chunk that still needs a dense embedding, with a
@@ -100,11 +116,16 @@ def submit_batch_job(
 
     Returns the job record dict (also written to S3 under JOBS_PREFIX) or None
     if `chunks` had nothing left to embed.
+
+    Raises InsufficientRecordsError (before any S3 write or Bedrock call) if
+    there are embeddable records but fewer than Bedrock's MIN_BATCH_RECORDS.
     """
     manifest_bytes, mapping = build_manifest(chunks, embedding_mod)
     if not mapping:
         logger.info("[EmbeddingBatch] nothing to embed for job_submission_id=%s (skipped)", job_submission_id)
         return None
+    if len(mapping) < MIN_BATCH_RECORDS:
+        raise InsufficientRecordsError(len(mapping))
 
     base = f"{payload_prefix}/{job_submission_id}"
     manifest_key = f"{base}/manifest.jsonl"
