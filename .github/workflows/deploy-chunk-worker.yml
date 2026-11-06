@@ -7,6 +7,7 @@ on:
       - "lambdas/worker/document-chunk-worker/**"
       - "lambdas/worker/ci-worker/**"
       - "lambdas/worker/search-worker/**"
+      - "lambdas/worker/embedding-batch-collector/**"
       - "lambdas/orchestrator/search-orchestrator/**"
       - "lambdas/ner/**"
       - "lambdas/normalize/**"
@@ -18,6 +19,7 @@ on:
       - "tools/deploy_ci_worker.sh"
       - "tools/deploy_search_worker.sh"
       - "tools/deploy_search_orchestrator.sh"
+      - "tools/deploy_embedding_batch_collector.sh"
       - ".github/workflows/deploy-chunk-worker.yml"
   workflow_dispatch:
     inputs:
@@ -32,6 +34,7 @@ on:
           - ci-worker
           - search-worker
           - search-orchestrator
+          - embedding-batch-collector
       deployment:
         description: "Deployment environment"
         required: false
@@ -42,6 +45,19 @@ on:
           - qa
           - cqa
           - prod
+      embedding_mode:
+        description: "document-chunk-worker embedding mode (batch submits one Bedrock batch-inference job per SQS invocation)"
+        required: false
+        default: sync
+        type: choice
+        options:
+          - sync
+          - batch
+      embedding_batch_role_arn:
+        description: "Bedrock service role ARN for batch-inference jobs (required when embedding_mode=batch)"
+        required: false
+        default: ""
+        type: string
 
 jobs:
   config:
@@ -62,6 +78,8 @@ jobs:
       results_debug_prefix:     ${{ steps.set.outputs.results_debug_prefix }}
       verify_max_out_tokens:    ${{ steps.set.outputs.verify_max_out_tokens }}
       verify_tokens_per_cand:   ${{ steps.set.outputs.verify_tokens_per_cand }}
+      embedding_mode:           ${{ steps.set.outputs.embedding_mode }}
+      embedding_batch_role_arn: ${{ steps.set.outputs.embedding_batch_role_arn }}
     steps:
       - name: Set config for deployment
         id: set
@@ -70,6 +88,8 @@ jobs:
           RESULTS_DEBUG_PREFIX="rls-ci-retrieval-search-results/debug"
           VERIFY_MAX_OUT_TOKENS="64000"
           VERIFY_TOKENS_PER_CAND="8000"
+          EMBEDDING_MODE="${{ github.event.inputs.embedding_mode || 'sync' }}"
+          EMBEDDING_BATCH_ROLE_ARN="${{ github.event.inputs.embedding_batch_role_arn || '' }}"
 
           case "$DEPLOYMENT" in
             dev)
@@ -126,6 +146,13 @@ jobs:
               ;;
           esac
 
+          # Reuse the Lambda execution role for Bedrock batch-inference jobs too
+          # (requires bedrock.amazonaws.com + self iam:PassRole on its trust/permissions
+          # policy) unless a dedicated role is explicitly passed in.
+          if [[ -z "$EMBEDDING_BATCH_ROLE_ARN" ]]; then
+            EMBEDDING_BATCH_ROLE_ARN="$ROLE_ARN"
+          fi
+
           {
             echo "deployment=$DEPLOYMENT"
             echo "aws_region=$AWS_REGION"
@@ -141,6 +168,8 @@ jobs:
             echo "results_debug_prefix=$RESULTS_DEBUG_PREFIX"
             echo "verify_max_out_tokens=$VERIFY_MAX_OUT_TOKENS"
             echo "verify_tokens_per_cand=$VERIFY_TOKENS_PER_CAND"
+            echo "embedding_mode=$EMBEDDING_MODE"
+            echo "embedding_batch_role_arn=$EMBEDDING_BATCH_ROLE_ARN"
           } >> "$GITHUB_OUTPUT"
 
   changes:
@@ -151,6 +180,7 @@ jobs:
       ci_worker:            ${{ steps.filter.outputs.ci_worker }}
       search_worker:        ${{ steps.filter.outputs.search_worker }}
       search_orchestrator:  ${{ steps.filter.outputs.search_orchestrator }}
+      embedding_batch_collector: ${{ steps.filter.outputs.embedding_batch_collector }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -183,6 +213,13 @@ jobs:
               - '.github/workflows/deploy-chunk-worker.yml'
             search_orchestrator:
               - 'lambdas/orchestrator/search-orchestrator/**'
+              - 'shared/**'
+              - '.github/workflows/deploy-chunk-worker.yml'
+            embedding_batch_collector:
+              - 'lambdas/worker/embedding-batch-collector/**'
+              - 'lambdas/embedding/**'
+              - 'lambdas/embedding_cohere/**'
+              - 'lambdas/index/**'
               - 'shared/**'
               - '.github/workflows/deploy-chunk-worker.yml'
 
@@ -232,6 +269,9 @@ jobs:
         env:
           ROLE_ARN: ${{ needs.config.outputs.role_arn }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          EMBEDDING_MODE: ${{ needs.config.outputs.embedding_mode }}
+          EMBEDDING_BATCH_PAYLOAD_BUCKET: ${{ needs.config.outputs.search_results_debug_bucket }}
+          EMBEDDING_BATCH_ROLE_ARN: ${{ needs.config.outputs.embedding_batch_role_arn }}
         run: |
           chmod +x tools/deploy_document_chunk_worker.sh
           tools/deploy_document_chunk_worker.sh
@@ -360,3 +400,42 @@ jobs:
         run: |
           chmod +x tools/deploy_search_orchestrator.sh
           tools/deploy_search_orchestrator.sh
+
+  # ── embedding-batch-collector ──────────────────────────────────────────────────
+  deploy-embedding-batch-collector:
+    name: Deploy embedding-batch-collector (rls-ci-retrieval-embedding-batch-collector)
+    needs: [config, changes]
+    if: |
+      (github.event_name == 'push' && needs.changes.outputs.embedding_batch_collector == 'true') ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.target == 'all' || github.event.inputs.target == 'embedding-batch-collector'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      FUNCTION_NAME:          rls-ci-retrieval-embedding-batch-collector
+      ECR_REPO:               rls-ci-retrieval-embedding-batch-collector
+      AWS_REGION:             ${{ needs.config.outputs.aws_region }}
+      CALLBACK_URL:           ${{ needs.config.outputs.callback_url }}
+      OPENSEARCH_ENDPOINT:    ${{ needs.config.outputs.opensearch_endpoint }}
+      OPEN_SEARCH_REGION:     ${{ needs.config.outputs.open_search_region }}
+      SECRETS_MANAGER_REGION: ${{ needs.config.outputs.secrets_manager_region }}
+      SEMANTIC_OBJECTS_INDEX: ${{ needs.config.outputs.semantic_objects_index }}
+      EMBEDDING_BATCH_PAYLOAD_BUCKET: ${{ needs.config.outputs.search_results_debug_bucket }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+      - name: Debug AWS identity
+        run: aws sts get-caller-identity
+      - uses: docker/setup-buildx-action@v3
+      - name: Deploy
+        env:
+          ROLE_ARN: ${{ needs.config.outputs.role_arn }}
+        run: |
+          chmod +x tools/deploy_embedding_batch_collector.sh
+          tools/deploy_embedding_batch_collector.sh

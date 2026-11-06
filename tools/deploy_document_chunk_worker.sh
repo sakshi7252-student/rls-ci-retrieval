@@ -25,6 +25,10 @@ EMBEDDING_MODEL="${EMBEDDING_MODEL:-amazon.titan-embed-text-v2:0}"
 EMBEDDING_MAX_WORKERS="${EMBEDDING_MAX_WORKERS:-2}"
 EMBEDDING_SKIP_TYPES="${EMBEDDING_SKIP_TYPES:-}"
 HF_TOKEN="${HF_TOKEN:-}"
+EMBEDDING_MODE="${EMBEDDING_MODE:-sync}"
+EMBEDDING_BATCH_PAYLOAD_BUCKET="${EMBEDDING_BATCH_PAYLOAD_BUCKET:-}"
+EMBEDDING_BATCH_PAYLOAD_PREFIX="${EMBEDDING_BATCH_PAYLOAD_PREFIX:-extractions/embedding-batch}"
+EMBEDDING_BATCH_ROLE_ARN="${EMBEDDING_BATCH_ROLE_ARN:-}"
 
 if [[ -z "$ROLE_ARN" ]]; then
   echo "ERROR: ROLE_ARN is required"
@@ -111,7 +115,7 @@ retry_lambda_update aws lambda update-function-configuration \
   --timeout "$TIMEOUT" \
   --memory-size "$MEMORY_SIZE" \
   --ephemeral-storage "{\"Size\": ${EPHEMERAL_STORAGE}}" \
-  --environment "Variables={CALLBACK_URL=${CALLBACK_URL},OPENSEARCH_ENDPOINT=${OPENSEARCH_ENDPOINT},OPEN_SEARCH_REGION=${OPEN_SEARCH_REGION},SECRETS_MANAGER_REGION=${SECRETS_MANAGER_REGION},OPENSEARCH_INDEX=${OPENSEARCH_INDEX},SEMANTIC_OBJECTS_INDEX=${SEMANTIC_OBJECTS_INDEX},OPENSEARCH_CI_INDEX=${OPENSEARCH_CI_INDEX},NER_MODEL=${NER_MODEL},EMBEDDING_MODEL=${EMBEDDING_MODEL},EMBEDDING_MAX_WORKERS=${EMBEDDING_MAX_WORKERS},EMBEDDING_SKIP_TYPES=${EMBEDDING_SKIP_TYPES},HF_HOME=/tmp/hf_cache${HF_TOKEN:+,HF_TOKEN=${HF_TOKEN}}}" \
+  --environment "Variables={CALLBACK_URL=${CALLBACK_URL},OPENSEARCH_ENDPOINT=${OPENSEARCH_ENDPOINT},OPEN_SEARCH_REGION=${OPEN_SEARCH_REGION},SECRETS_MANAGER_REGION=${SECRETS_MANAGER_REGION},OPENSEARCH_INDEX=${OPENSEARCH_INDEX},SEMANTIC_OBJECTS_INDEX=${SEMANTIC_OBJECTS_INDEX},OPENSEARCH_CI_INDEX=${OPENSEARCH_CI_INDEX},NER_MODEL=${NER_MODEL},EMBEDDING_MODEL=${EMBEDDING_MODEL},EMBEDDING_MAX_WORKERS=${EMBEDDING_MAX_WORKERS},EMBEDDING_SKIP_TYPES=${EMBEDDING_SKIP_TYPES},HF_HOME=/tmp/hf_cache,EMBEDDING_MODE=${EMBEDDING_MODE},EMBEDDING_BATCH_PAYLOAD_BUCKET=${EMBEDDING_BATCH_PAYLOAD_BUCKET},EMBEDDING_BATCH_PAYLOAD_PREFIX=${EMBEDDING_BATCH_PAYLOAD_PREFIX},EMBEDDING_BATCH_ROLE_ARN=${EMBEDDING_BATCH_ROLE_ARN}${HF_TOKEN:+,HF_TOKEN=${HF_TOKEN}}}" \
   --region "$AWS_REGION" >/dev/null
 
 wait_for_lambda_update
@@ -120,11 +124,23 @@ echo "Deployed ${FUNCTION_NAME}"
 echo "Image: ${IMAGE_URI}"
 
 echo
-echo "Next: connect SQS queue to Lambda"
-echo "aws lambda create-event-source-mapping \\
+if [[ "$EMBEDDING_MODE" == "batch" ]]; then
+  echo "Next: connect SQS queue to Lambda (EMBEDDING_MODE=batch — size per invocation, tune 300-500)"
+  echo "aws lambda create-event-source-mapping \\
+  --function-name ${FUNCTION_NAME} \\
+  --event-source-arn <SQS_QUEUE_ARN> \\
+  --batch-size 300 \\
+  --maximum-batching-window-in-seconds 30 \\
+  --function-response-types ReportBatchItemFailures \\
+  --scaling-config MaximumConcurrency=50 \\
+  --region ${AWS_REGION}"
+else
+  echo "Next: connect SQS queue to Lambda"
+  echo "aws lambda create-event-source-mapping \\
   --function-name ${FUNCTION_NAME} \\
   --event-source-arn <SQS_QUEUE_ARN> \\
   --batch-size 1 \\
   --function-response-types ReportBatchItemFailures \\
   --scaling-config MaximumConcurrency=50 \\
   --region ${AWS_REGION}"
+fi

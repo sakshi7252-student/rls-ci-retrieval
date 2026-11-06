@@ -8,9 +8,11 @@ import resource
 import sys
 import time
 import types
+import uuid
 from pathlib import Path
 from typing import Any
 
+from shared import embedding_batch
 from shared.server_notify import (
     notify_document_failed_chunk,
     notify_document_indexed_chunk,
@@ -37,6 +39,16 @@ _aws: dict[str, Any] = {}
 _EMBEDDING_MODULE: tuple[str, str] = {
     "cohere": ("embedding_cohere", "embedding_cohere"),
 }.get(os.environ.get("EMBEDDING_PROVIDER", "titan"), ("embedding", "embedding"))
+
+# "sync" (default) keeps today's per-chunk InvokeModel behaviour unchanged.
+# "batch" submits ONE Bedrock batch-inference job per SQS invocation, covering
+# every chunk this Lambda received in that invocation — whatever the batch
+# size turned out to be. A separate embedding-batch-collector Lambda polls the
+# job and finishes indexing + the indexed/failed-chunk callbacks once it completes.
+EMBEDDING_MODE = os.environ.get("EMBEDDING_MODE", "sync")
+EMBEDDING_BATCH_PAYLOAD_BUCKET = os.environ.get("EMBEDDING_BATCH_PAYLOAD_BUCKET", "")
+EMBEDDING_BATCH_PAYLOAD_PREFIX = os.environ.get("EMBEDDING_BATCH_PAYLOAD_PREFIX", "extractions/embedding-batch")
+EMBEDDING_BATCH_ROLE_ARN = os.environ.get("EMBEDDING_BATCH_ROLE_ARN", "")
 
 
 def _get(service: str):
@@ -173,6 +185,46 @@ def _run_chunk(chunk: dict, context: Any = None) -> dict:
         "elapsed_s": elapsed,
         "timings": timings,
     }
+
+
+def _prepare_chunk_for_batch(chunk: dict, context: Any = None) -> dict:
+    """normalize -> ner -> ontology only; embedding/index are deferred to the
+    batch-inference collector once the submitted Bedrock job completes."""
+    normalize = _load("normalize", "normalize")
+    ner = _load("ner", "ner")
+    ontology = _load("ontology", "ontology")
+
+    t0 = time.perf_counter()
+    chunk = normalize._process_document(chunk)
+    chunk = ner._process_document(chunk)
+    chunk = ontology._process_document(chunk)
+    logger.info(
+        "[ChunkWorker] prepared chunk_id=%s elapsed_s=%.3f",
+        chunk.get("chunk_id"), time.perf_counter() - t0,
+    )
+    return chunk
+
+
+def _submit_embedding_batch(chunks: list[dict], context: Any = None) -> dict | None:
+    if not EMBEDDING_BATCH_PAYLOAD_BUCKET:
+        raise ValueError("EMBEDDING_BATCH_PAYLOAD_BUCKET is required when EMBEDDING_MODE=batch")
+    if not EMBEDDING_BATCH_ROLE_ARN:
+        raise ValueError("EMBEDDING_BATCH_ROLE_ARN is required when EMBEDDING_MODE=batch")
+
+    embedding = _load(*_EMBEDDING_MODULE)
+    job_submission_id = getattr(context, "aws_request_id", "") or uuid.uuid4().hex
+
+    return embedding_batch.submit_batch_job(
+        bedrock_client=_get("bedrock"),
+        s3_client=_get("s3"),
+        payload_bucket=EMBEDDING_BATCH_PAYLOAD_BUCKET,
+        payload_prefix=EMBEDDING_BATCH_PAYLOAD_PREFIX,
+        role_arn=EMBEDDING_BATCH_ROLE_ARN,
+        model_id=embedding.EMBEDDING_MODEL,
+        job_submission_id=job_submission_id,
+        chunks=chunks,
+        embedding_mod=embedding,
+    )
 
 
 def _get_attempt_id(chunk: dict) -> str | None:
@@ -381,6 +433,75 @@ def _notify_failed(chunk: dict, exc: Exception) -> None:
     )
 
 
+def _handle_batch_sqs_invoke(event: dict, context: Any) -> dict:
+    """EMBEDDING_MODE=batch: run normalize/ner/ontology for every record this
+    invocation received, then submit ONE Bedrock batch-inference job covering
+    the whole invocation's batch (whatever size SQS handed us). Embedding,
+    indexing, and the indexed/failed-chunk callbacks happen later in
+    embedding-batch-collector once that job completes."""
+    failures: list[dict[str, str]] = []
+    processed = 0
+    prepared: list[tuple[str, dict]] = []
+
+    for record in event.get("Records", []):
+        message_id = record.get("messageId", "")
+
+        if context is not None:
+            remaining_ms = context.get_remaining_time_in_millis()
+            if remaining_ms < _MIN_REMAINING_MS:
+                logger.warning(
+                    "[ChunkWorker] only %d ms remaining — requeueing message_id=%s",
+                    remaining_ms, message_id,
+                )
+                if message_id:
+                    failures.append({"itemIdentifier": message_id})
+                continue
+
+        chunk = None
+        try:
+            chunk = _decode_payload(record)
+            sent_ts_str = record.get("attributes", {}).get("SentTimestamp")
+            if sent_ts_str:
+                chunk["_queue_wait_ms"] = int(time.time() * 1000) - int(sent_ts_str)
+            if context is not None:
+                chunk["_memory_limit_mb"] = int(getattr(context, "memory_limit_in_mb", 0) or 0)
+            chunk = _prepare_chunk_for_batch(chunk, context)
+            prepared.append((message_id, chunk))
+            processed += 1
+        except Exception as exc:
+            chunk_id = chunk.get("chunk_id", "?") if chunk else "?"
+            logger.exception(
+                "[ChunkWorker] prepare failed message_id=%s chunk_id=%s error=%s",
+                message_id, chunk_id, exc,
+            )
+            if chunk is not None and _is_final_sqs_attempt(record):
+                _notify_failed(chunk, exc)
+            if message_id:
+                failures.append({"itemIdentifier": message_id})
+
+    if prepared:
+        try:
+            _submit_embedding_batch([c for _, c in prepared], context)
+        except Exception as exc:
+            # Submission is all-or-nothing for this invocation's batch: if the
+            # Bedrock job never got submitted, none of these chunks were handed
+            # off anywhere, so every one of them must go back on the queue.
+            logger.exception(
+                "[ChunkWorker] batch embedding submission failed for %d chunks: %s",
+                len(prepared), exc,
+            )
+            for message_id, _chunk in prepared:
+                if message_id:
+                    failures.append({"itemIdentifier": message_id})
+            processed -= len(prepared)
+
+    return {
+        "processed": processed,
+        "failed": len(failures),
+        "batchItemFailures": failures,
+    }
+
+
 def handler(event: dict, context: Any) -> dict:
     # Direct invoke for smoke testing
     if "Records" not in event:
@@ -393,6 +514,9 @@ def handler(event: dict, context: Any) -> dict:
         return result
 
     # SQS batch invoke
+    if EMBEDDING_MODE == "batch":
+        return _handle_batch_sqs_invoke(event, context)
+
     failures: list[dict[str, str]] = []
     processed = 0
 
