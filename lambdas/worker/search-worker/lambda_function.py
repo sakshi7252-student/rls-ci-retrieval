@@ -1112,6 +1112,14 @@ def _hit_with_provenance(hit: dict, debug: bool = False) -> dict:
         "score_breakdown":       hit.get("score_breakdown"),
         "agg_score_breakdown":   hit.get("agg_score_breakdown"),
         "llm_verified":          hit.get("llm_verified"),
+        # Preserve the original LLM verifier output separately from the later
+        # evidence-classifier result below. The UI/debug final-hit record needs
+        # both explanations for auditability.
+        "verifier_reason":       hit.get("reason", ""),
+        "verifier_identity":     hit.get("identity", {}),
+        "verifier_supporting_sentences": hit.get("supporting_sentences", []),
+        "verifier_highlight_type": hit.get("highlight_type", "sentence"),
+        "verifier_primary_support_index": hit.get("primary_support_index", 0),
         "disagreement_route":    hit.get("disagreement_route"),
         "verdict_override_reason": hit.get("verdict_override_reason"),
 
